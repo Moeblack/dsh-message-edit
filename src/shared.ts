@@ -22,11 +22,23 @@ export interface MessageEditEffect {
   operation: VersionOperation
   cascade: CascadePolicy
   targetTurn: number
-  targetEventSeq: number
+  targetEventSeq?: number
   targetBlockIndex?: number
   blockKind?: EditableBlockKind
   before?: string
   after?: string
+  /** Every cached change atomically applied when this version was created. */
+  changes?: readonly MessageEditEffectChange[]
+}
+
+/** One durable replacement or whole-message removal within an edit effect. */
+export interface MessageEditEffectChange {
+  eventSeq: number
+  blockIndex: number
+  blockKind: EditableBlockKind
+  before: string
+  after?: string
+  deleted?: boolean
 }
 
 /** Inverse half generated together with a version effect. */
@@ -72,9 +84,10 @@ export interface EditableMessageBlock {
 /** One completed message-triggered turn eligible for Retry. */
 export interface RetryableTurn {
   turn: number
-  userEventSeq: number
+  userEventSeq?: number
   preview: string
   time: number
+  retryable: boolean
 }
 
 /** One session version in the complete known lineage tree. */
@@ -108,12 +121,23 @@ export interface MessageEditTimeline {
 }
 
 /** Edit one text/reasoning block and regenerate from its turn boundary. */
-export interface EditOperation {
-  action: 'edit'
-  sessionId: string
+export type MessageEditChange = {
+  action: 'replace'
   eventSeq: number
   blockIndex: number
   text: string
+} | {
+  /** Remove the entire message event, rather than blanking its text. */
+  action: 'delete'
+  eventSeq: number
+}
+
+/** Atomically apply every cached change within one settled turn. */
+export interface EditOperation {
+  action: 'edit'
+  sessionId: string
+  turn: number
+  changes: MessageEditChange[]
   cascade: CascadePolicy
 }
 

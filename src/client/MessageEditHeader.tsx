@@ -9,20 +9,17 @@ type MessageEditHeaderProps = PropsRuntime<'conversation.session.header.actions'
 /** Header contribution shared with the Timeline controller. */
 export function MessageEditHeader({
   useMessageEdit,
-  acquire,
   load,
   openVersion,
   reroll,
-  edit,
+  save,
+  delete: deleteDraft,
+  commit,
   retry,
 }: MessageEditHeaderProps): ReactNode {
   const state = useMessageEdit(value => value)
 
-  useEffect(() => {
-    const release = acquire()
-    load()
-    return release
-  }, [acquire, load])
+  useEffect(() => { load() }, [load])
 
   const timeline = state.timeline
   const versions = state.timeline?.versions ?? []
@@ -35,7 +32,10 @@ export function MessageEditHeader({
     <>
       <InlineMessageEdit
         messages={state.status === 'ready' && state.pending === null ? timeline?.messages ?? [] : []}
-        edit={edit}
+        drafts={state.drafts}
+        save={save}
+        delete={deleteDraft}
+        commit={commit}
         retry={retry}
       />
       <div className={styles['root']}>

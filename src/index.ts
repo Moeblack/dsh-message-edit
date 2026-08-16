@@ -25,10 +25,11 @@ import {
   MESSAGE_EDIT_VERSION_SCHEMA,
   type CascadePolicy,
   type EditOperation,
-  type EditableBlockKind,
   type EditableMessageBlock,
   type LegacyMessageEditVersionEvent,
   type MessageEditEffect,
+  type MessageEditEffectChange,
+  type MessageEditChange,
   type MessageEditOperation,
   type MessageEditOperationResult,
   type MessageEditTimeline,
@@ -52,6 +53,8 @@ export type {
   MessageEditOperationResult,
   MessageEditTimeline,
   MessageEditEffect,
+  MessageEditEffectChange,
+  MessageEditChange,
   MessageEditInverse,
   MessageEditVersionEvent,
   RerollOperation,
@@ -121,8 +124,8 @@ interface ClosedTurn {
 
 interface ManualAssistantTurn {
   turn: number
-  user: UserMessage
-  assistant: AssistantMessage
+  user?: UserMessage
+  assistants: AssistantMessage[]
 }
 
 interface OperationPlan {
@@ -171,12 +174,15 @@ function cloneUser(message: UserMessage, content: ContentBlock[] = structuredClo
   }) as UserMessage
 }
 
-function replaceTextBlock(content: readonly ContentBlock[], blockIndex: number, text: string): ContentBlock[] {
-  const block = content[blockIndex]
-  if (!isTextualBlock(block)) throw new Error('所选内容块不是可编辑文本。')
-  return content.map((candidate, index) => index === blockIndex
-    ? { ...candidate, text } as ContentBlock
-    : structuredClone(candidate))
+function replaceTextBlocks(
+  content: readonly ContentBlock[],
+  replacements: ReadonlyMap<number, string>,
+): ContentBlock[] {
+  return content.map((candidate, index) => {
+    if (!replacements.has(index)) return structuredClone(candidate)
+    if (!isTextualBlock(candidate)) throw new Error('所选内容块不是可编辑文本。')
+    return { ...candidate, text: replacements.get(index) ?? '' } as ContentBlock
+  })
 }
 
 /** Fold complete turn brackets; an open tail is deliberately absent. */
@@ -247,12 +253,17 @@ function editableMessages(turns: readonly ClosedTurn[]): EditableMessageBlock[] 
 }
 
 function retryableTurns(turns: readonly ClosedTurn[]): RetryableTurn[] {
-  return turns.flatMap((turn): RetryableTurn[] => turn.user === undefined ? [] : [{
-    turn: turn.turn,
-    userEventSeq: turn.user.seq,
-    preview: userText(turn.user.data),
-    time: turn.user.time,
-  }])
+  return turns.map((turn): RetryableTurn => {
+    const user = turn.user
+    const firstAssistant = turn.assistants[0]
+    return {
+      turn: turn.turn,
+      ...user === undefined ? {} : { userEventSeq: user.seq },
+      preview: user === undefined ? '' : userText(user.data),
+      time: user?.time ?? firstAssistant?.time ?? 0,
+      retryable: user !== undefined,
+    }
+  })
 }
 
 function downstreamUsers(turns: readonly ClosedTurn[], start: number): UserMessage[] {
@@ -261,73 +272,124 @@ function downstreamUsers(turns: readonly ClosedTurn[], start: number): UserMessa
     : [cloneUser(turn.user.data)])
 }
 
-function assistantReplacement(event: AssistantEvent, blockIndex: number, text: string): AssistantMessage {
-  const replaced = replaceTextBlock(event.data.message.content, blockIndex, text)
-    .filter(block => block.type === 'text' || block.type === 'reasoning')
+function cloneAssistant(message: AssistantMessage, content: ContentBlock[] = structuredClone(message.content)): AssistantMessage {
+  const replayState = message.source.replayState
   return Object.freeze({
     id: crypto.randomUUID(),
     role: 'assistant' as const,
-    content: Object.freeze(replaced),
+    content: Object.freeze(content),
     source: Object.freeze({
       kind: 'model' as const,
-      provider: event.data.message.source.provider,
-      model: event.data.message.source.model,
+      provider: message.source.provider,
+      model: message.source.model,
+      ...replayState === undefined ? {} : { replayState: structuredClone(replayState) },
     }),
   }) as AssistantMessage
 }
 
 function editPlan(operation: EditOperation, turns: readonly ClosedTurn[]): OperationPlan {
-  const turnIndex = turns.findIndex(turn => operation.eventSeq > turn.startSeq && operation.eventSeq < turn.endSeq)
+  if (operation.changes.length === 0) throw new Error('没有可提交的编辑草稿。')
+  const turnIndex = turns.findIndex(turn => turn.turn === operation.turn)
   const turn = turns[turnIndex]
-  if (turn === undefined) throw new Error('所选消息不属于已落定回合。')
-  const event = turn.user?.seq === operation.eventSeq
-    ? turn.user
-    : turn.assistants.find(candidate => candidate.seq === operation.eventSeq)
-  if (event === undefined) throw new Error('所选消息不存在或不可编辑。')
+  if (turn === undefined) throw new Error('所选回合不存在或尚未落定。')
+  const events = new Map<number, UserEvent | AssistantEvent>()
+  if (turn.user !== undefined) events.set(turn.user.seq, turn.user)
+  for (const assistant of turn.assistants) events.set(assistant.seq, assistant)
 
-  if (event.type === 'user/message') {
-    const before = event.data.content[operation.blockIndex]
-    if (before?.type !== 'text') throw new Error('所选用户消息块不是文本。')
-    const edited = cloneUser(event.data, replaceTextBlock(event.data.content, operation.blockIndex, operation.text))
+  const replacements = new Map<number, Map<number, string>>()
+  const deletedEvents = new Set<number>()
+  const effectChanges: MessageEditEffectChange[] = []
+  for (const change of operation.changes) {
+    const event = events.get(change.eventSeq)
+    if (event === undefined) throw new Error('编辑草稿包含不属于目标回合的消息。')
+    if (change.action === 'delete') {
+      if (deletedEvents.has(event.seq)) throw new Error('同一条消息被重复删除。')
+      deletedEvents.add(event.seq)
+      const content = event.type === 'user/message' ? event.data.content : event.data.message.content
+      for (const [blockIndex, block] of content.entries()) {
+        if (!isTextualBlock(block)) continue
+        effectChanges.push({
+          eventSeq: event.seq,
+          blockIndex,
+          blockKind: event.type === 'user/message'
+            ? 'user'
+            : block.type === 'reasoning' ? 'assistant.reasoning' : 'assistant.response',
+          before: block.text,
+          deleted: true,
+        })
+      }
+      continue
+    }
+
+    const content = event.type === 'user/message' ? event.data.content : event.data.message.content
+    const before = content[change.blockIndex]
+    if (!isTextualBlock(before)) throw new Error('编辑草稿包含非文本内容块。')
+    if (event.type === 'user/message' && before.type !== 'text') {
+      throw new Error('用户消息只能编辑文本块。')
+    }
+    let eventReplacements = replacements.get(event.seq)
+    if (eventReplacements === undefined) {
+      eventReplacements = new Map<number, string>()
+      replacements.set(event.seq, eventReplacements)
+    }
+    if (eventReplacements.has(change.blockIndex)) throw new Error('同一内容块被重复编辑。')
+    eventReplacements.set(change.blockIndex, change.text)
+    effectChanges.push({
+      eventSeq: event.seq,
+      blockIndex: change.blockIndex,
+      blockKind: event.type === 'user/message'
+        ? 'user'
+        : before.type === 'reasoning' ? 'assistant.reasoning' : 'assistant.response',
+      before: before.text,
+      after: change.text,
+    })
+  }
+  for (const eventSeq of replacements.keys()) {
+    if (deletedEvents.has(eventSeq)) {
+      throw new Error('同一条消息不能同时编辑和删除。')
+    }
+  }
+  const primaryChange = effectChanges[0]
+  if (primaryChange === undefined) throw new Error('删除的消息没有可记录的文本内容。')
+  const version = pairVersionEffect(operation.sessionId, {
+    operation: 'edit',
+    cascade: operation.cascade,
+    targetTurn: turn.turn,
+    targetEventSeq: primaryChange.eventSeq,
+    targetBlockIndex: primaryChange.blockIndex,
+    blockKind: primaryChange.blockKind,
+    before: primaryChange.before,
+    ...primaryChange.after === undefined ? {} : { after: primaryChange.after },
+    changes: effectChanges,
+  })
+  const userDeleted = turn.user !== undefined && deletedEvents.has(turn.user.seq)
+  const editedUser = turn.user === undefined || userDeleted
+    ? undefined
+    : cloneUser(turn.user.data, replaceTextBlocks(turn.user.data.content, replacements.get(turn.user.seq) ?? new Map()))
+  const assistantChanged = turn.assistants.some(event => (
+    deletedEvents.has(event.seq) || replacements.has(event.seq)
+  ))
+  if (!assistantChanged && !userDeleted) {
+    if (editedUser === undefined) throw new Error('目标回合没有可重新执行的用户输入。')
     const later = operation.cascade === 'preserve' ? downstreamUsers(turns, turnIndex + 1) : []
     return {
       boundary: turn.startSeq - 1,
-      version: pairVersionEffect(operation.sessionId, {
-        operation: 'edit',
-        cascade: operation.cascade,
-        targetTurn: turn.turn,
-        targetEventSeq: event.seq,
-        targetBlockIndex: operation.blockIndex,
-        blockKind: 'user',
-        before: before.text,
-        after: operation.text,
-      }),
-      queuedUsers: [edited, ...later],
+      version,
+      queuedUsers: [editedUser, ...later],
     }
   }
-
-  const before = event.data.message.content[operation.blockIndex]
-  if (!isTextualBlock(before)) throw new Error('所选助手消息块不是文本或思考。')
-  const blockKind: EditableBlockKind = before.type === 'reasoning'
-    ? 'assistant.reasoning'
-    : 'assistant.response'
-  if (turn.user === undefined) throw new Error('所选助手消息没有可重建的用户输入。')
   return {
     boundary: turn.startSeq - 1,
-    version: pairVersionEffect(operation.sessionId, {
-      operation: 'edit',
-      cascade: operation.cascade,
-      targetTurn: turn.turn,
-      targetEventSeq: event.seq,
-      targetBlockIndex: operation.blockIndex,
-      blockKind,
-      before: before.text,
-      after: operation.text,
-    }),
+    version,
     manualTurn: {
       turn: turn.turn,
-      user: cloneUser(turn.user.data),
-      assistant: assistantReplacement(event, operation.blockIndex, operation.text),
+      ...editedUser === undefined ? {} : { user: editedUser },
+      assistants: turn.assistants
+        .filter(event => !deletedEvents.has(event.seq))
+        .map(event => cloneAssistant(
+          event.data.message,
+          replaceTextBlocks(event.data.message.content, replacements.get(event.seq) ?? new Map()),
+        )),
     },
     queuedUsers: operation.cascade === 'preserve'
       ? downstreamUsers(turns, turnIndex + 1)
@@ -441,8 +503,15 @@ function appendLogSeedEvent<T extends Exclude<SessionEventType, SurfaceEventType
   events: SessionEvent[],
   type: T,
   data: SessionEvent<T>['data'],
+  ignorable = false,
 ): void {
-  events.push({ type, seq: events.length, time: Date.now(), data } as SessionEvent<T>)
+  events.push({
+    type,
+    seq: events.length,
+    time: Date.now(),
+    data,
+    ...(ignorable ? { ignorable: true } : {}),
+  } as SessionEvent<T>)
 }
 
 function appendSurfaceSeedEvent<T extends SurfaceEventType>(
@@ -462,15 +531,18 @@ function appendSurfaceSeedEvent<T extends SurfaceEventType>(
 }
 
 function appendManualTurn(events: SessionEvent[], manual: ManualAssistantTurn): void {
-  const { turn, user, assistant } = manual
+  const { turn, user, assistants } = manual
   appendLogSeedEvent(events, 'turn/start', { turn })
-  appendSurfaceSeedEvent(events, 'user/message', user, { surfaceOp: 'append' })
-  appendLogSeedEvent(events, 'step/start', { turn, step: 1 })
-  appendSurfaceSeedEvent(events, 'assistant/message', { turn, step: 1, message: assistant }, {
-    surfaceOp: 'append',
-    sourceEventSeqs: [],
-  })
-  appendLogSeedEvent(events, 'step/end', { turn, step: 1 })
+  if (user !== undefined) appendSurfaceSeedEvent(events, 'user/message', user, { surfaceOp: 'append' })
+  for (const [index, assistant] of assistants.entries()) {
+    const step = index + 1
+    appendLogSeedEvent(events, 'step/start', { turn, step })
+    appendSurfaceSeedEvent(events, 'assistant/message', { turn, step, message: assistant }, {
+      surfaceOp: 'append',
+      sourceEventSeqs: [],
+    })
+    appendLogSeedEvent(events, 'step/end', { turn, step })
+  }
   appendLogSeedEvent(events, 'turn/end', { turn, reason: { kind: 'completed' } })
 }
 
@@ -480,7 +552,7 @@ function versionSeed(source: Session, plan: OperationPlan): {
 } {
   const events = inheritedSeed(source, plan.boundary)
   const inheritedLength = events.length
-  appendLogSeedEvent(events, 'message-edit/version', plan.version)
+  appendLogSeedEvent(events, 'message-edit/version', plan.version, true)
   if (plan.manualTurn !== undefined) appendManualTurn(events, plan.manualTurn)
   return { events, inheritedLength }
 }
@@ -649,55 +721,6 @@ function flattenLineage(
   return result
 }
 
-/** Minimal read face of the optional persistence service; borrowed events are
- * consumed synchronously inside one timeline projection. */
-interface PersistenceReaderLike {
-  inspect(sessionId: SessionId, signal?: AbortSignal): Promise<{ events: readonly SessionEvent[] }>
-  readFrom(sessionId: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ events: readonly SessionEvent[] }>
-}
-
-/** Bounded parallel inspection of persisted branches; matches the corpus worker shape. */
-const TIMELINE_READ_CONCURRENCY = 4
-
-async function mapConcurrent<T, R>(
-  items: readonly T[],
-  worker: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length)
-  let cursor = 0
-  const run = async (): Promise<void> => {
-    for (;;) {
-      const index = cursor
-      cursor += 1
-      if (index >= items.length) return
-      results[index] = await worker(items[index] as T)
-    }
-  }
-  const workers = Math.min(TIMELINE_READ_CONCURRENCY, items.length)
-  await Promise.all(Array.from({ length: workers }, () => run()))
-  return results
-}
-
-/** Full log for the requested session: live borrow, persisted inspection, query fallback. */
-async function readCurrentLog(ctx: Context, sessionId: SessionId): Promise<readonly SessionEvent[]> {
-  const live = ctx.sessions.get(sessionId)
-  if (live !== undefined) return live.events
-  const persistence = ctx.get('sessionPersistence') as PersistenceReaderLike | undefined
-  if (persistence !== undefined) return (await persistence.inspect(sessionId)).events
-  return (await ctx.sessionQuery.readSession(sessionId)).events
-}
-
-/** Own-version scan window for one lineage node: the tail from the durable
- * seed boundary is enough, and root nodes cannot carry a version effect. */
-async function versionLog(ctx: Context, record: SessionRecord): Promise<readonly SessionEvent[]> {
-  const inherited = record.header.seedLength ?? 0
-  const live = ctx.sessions.get(record.header.id)
-  if (live !== undefined) return live.events.slice(inherited)
-  const persistence = ctx.get('sessionPersistence') as PersistenceReaderLike | undefined
-  if (persistence !== undefined) return (await persistence.readFrom(record.header.id, inherited)).events
-  return (await ctx.sessionQuery.readSession(record.header.id)).events.slice(inherited)
-}
-
 async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEditTimeline> {
   const targetTrace = await ctx.sessionQuery.traceSession(sessionId)
   const rootId = targetTrace.complete
@@ -705,11 +728,7 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
     : targetTrace.ancestors.at(-1)?.header.id ?? sessionId
   const rootTrace = rootId === sessionId ? targetTrace : await ctx.sessionQuery.traceSession(rootId)
   const lineage = flattenLineage(rootTrace.target, rootTrace.descendants)
-  const logs = await mapConcurrent(lineage, async ({ record }): Promise<readonly SessionEvent[]> => {
-    if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId)
-    if (record.header.parentSession === undefined) return []
-    return versionLog(ctx, record)
-  })
+  const logs = await Promise.all(lineage.map(({ record }) => ctx.sessionQuery.readSession(record.header.id)))
   const recordsById = new Map(lineage.map(({ record }) => [record.header.id, record]))
   const currentPath = new Set<SessionId>()
   let pathId: SessionId | undefined = sessionId
@@ -719,7 +738,7 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
   }
 
   const versions: VersionSummary[] = lineage.map(({ record, depth }, index) => {
-    const version = ownVersionEvent(record.header, logs[index] ?? [])
+    const version = ownVersionEvent(record.header, logs[index]?.events ?? [])
     return {
       sessionId: record.header.id,
       ...record.header.parentSession === undefined ? {} : { parentSessionId: record.header.parentSession },
@@ -765,7 +784,7 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
   const currentIndex = versions.findIndex(version => version.current)
   const currentLog = logs[currentIndex]
   if (currentIndex < 0 || currentLog === undefined) throw new Error('当前版本不在版本树中。')
-  const turns = closedTurns(currentLog)
+  const turns = closedTurns(currentLog.events)
   return {
     sessionId,
     messages: editableMessages(turns),
@@ -805,13 +824,11 @@ function decodeOperation(value: unknown): MessageEditOperation {
   const sessionId = sessionIdOf(record['sessionId'])
   switch (record['action']) {
     case 'edit':
-      if (typeof record['text'] !== 'string') throw new TypeError('text 必须是字符串。')
       return {
         action: 'edit',
         sessionId,
-        eventSeq: integerOf(record['eventSeq'], 'eventSeq'),
-        blockIndex: integerOf(record['blockIndex'], 'blockIndex'),
-        text: record['text'],
+        turn: integerOf(record['turn'], 'turn'),
+        changes: editChangesOf(record['changes']),
         cascade: cascadeOf(record['cascade']),
       }
     case 'reroll':
@@ -826,6 +843,25 @@ function decodeOperation(value: unknown): MessageEditOperation {
     default:
       throw new TypeError('action 必须是 edit、reroll 或 retry。')
   }
+}
+
+function editChangesOf(value: unknown): MessageEditChange[] {
+  if (!Array.isArray(value) || value.length === 0) throw new TypeError('changes 必须是非空数组。')
+  return value.map((item, index): MessageEditChange => {
+    const record = objectValue(item)
+    const eventSeq = integerOf(record['eventSeq'], `changes[${String(index)}].eventSeq`)
+    if (record['action'] === 'delete') return { action: 'delete', eventSeq }
+    if (record['action'] === 'replace') {
+      if (typeof record['text'] !== 'string') throw new TypeError(`changes[${String(index)}].text 必须是字符串。`)
+      return {
+        action: 'replace',
+        eventSeq,
+        blockIndex: integerOf(record['blockIndex'], `changes[${String(index)}].blockIndex`),
+        text: record['text'],
+      }
+    }
+    throw new TypeError(`changes[${String(index)}].action 必须是 replace 或 delete。`)
+  })
 }
 
 function requestJson(request: HttpRequestLike): Promise<unknown> {

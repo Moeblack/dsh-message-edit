@@ -1,3 +1,4 @@
 .dsh/
 dist/
 node_modules/
+*.tgz

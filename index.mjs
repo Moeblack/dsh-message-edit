@@ -45,13 +45,15 @@ function cloneUser(message, content = structuredClone(message.content)) {
 		source: Object.freeze({ kind: "user" })
 	});
 }
-function replaceTextBlock(content, blockIndex, text) {
-	const block = content[blockIndex];
-	if (!isTextualBlock(block)) throw new Error("所选内容块不是可编辑文本。");
-	return content.map((candidate, index) => index === blockIndex ? {
-		...candidate,
-		text
-	} : structuredClone(candidate));
+function replaceTextBlocks(content, replacements) {
+	return content.map((candidate, index) => {
+		if (!replacements.has(index)) return structuredClone(candidate);
+		if (!isTextualBlock(candidate)) throw new Error("所选内容块不是可编辑文本。");
+		return {
+			...candidate,
+			text: replacements.get(index) ?? ""
+		};
+	});
 }
 /** Fold complete turn brackets; an open tail is deliberately absent. */
 function closedTurns(events) {
@@ -116,75 +118,115 @@ function editableMessages(turns) {
 	return result;
 }
 function retryableTurns(turns) {
-	return turns.flatMap((turn) => turn.user === void 0 ? [] : [{
-		turn: turn.turn,
-		userEventSeq: turn.user.seq,
-		preview: userText(turn.user.data),
-		time: turn.user.time
-	}]);
+	return turns.map((turn) => {
+		const user = turn.user;
+		const firstAssistant = turn.assistants[0];
+		return {
+			turn: turn.turn,
+			...user === void 0 ? {} : { userEventSeq: user.seq },
+			preview: user === void 0 ? "" : userText(user.data),
+			time: user?.time ?? firstAssistant?.time ?? 0,
+			retryable: user !== void 0
+		};
+	});
 }
 function downstreamUsers(turns, start) {
 	return turns.slice(start).flatMap((turn) => turn.user === void 0 ? [] : [cloneUser(turn.user.data)]);
 }
-function assistantReplacement(event, blockIndex, text) {
-	const replaced = replaceTextBlock(event.data.message.content, blockIndex, text).filter((block) => block.type === "text" || block.type === "reasoning");
+function cloneAssistant(message, content = structuredClone(message.content)) {
+	const replayState = message.source.replayState;
 	return Object.freeze({
 		id: crypto.randomUUID(),
 		role: "assistant",
-		content: Object.freeze(replaced),
+		content: Object.freeze(content),
 		source: Object.freeze({
 			kind: "model",
-			provider: event.data.message.source.provider,
-			model: event.data.message.source.model
+			provider: message.source.provider,
+			model: message.source.model,
+			...replayState === void 0 ? {} : { replayState: structuredClone(replayState) }
 		})
 	});
 }
 function editPlan(operation, turns) {
-	const turnIndex = turns.findIndex((turn) => operation.eventSeq > turn.startSeq && operation.eventSeq < turn.endSeq);
+	if (operation.changes.length === 0) throw new Error("没有可提交的编辑草稿。");
+	const turnIndex = turns.findIndex((turn) => turn.turn === operation.turn);
 	const turn = turns[turnIndex];
-	if (turn === void 0) throw new Error("所选消息不属于已落定回合。");
-	const event = turn.user?.seq === operation.eventSeq ? turn.user : turn.assistants.find((candidate) => candidate.seq === operation.eventSeq);
-	if (event === void 0) throw new Error("所选消息不存在或不可编辑。");
-	if (event.type === "user/message") {
-		const before = event.data.content[operation.blockIndex];
-		if (before?.type !== "text") throw new Error("所选用户消息块不是文本。");
-		const edited = cloneUser(event.data, replaceTextBlock(event.data.content, operation.blockIndex, operation.text));
+	if (turn === void 0) throw new Error("所选回合不存在或尚未落定。");
+	const events = /* @__PURE__ */ new Map();
+	if (turn.user !== void 0) events.set(turn.user.seq, turn.user);
+	for (const assistant of turn.assistants) events.set(assistant.seq, assistant);
+	const replacements = /* @__PURE__ */ new Map();
+	const deletedEvents = /* @__PURE__ */ new Set();
+	const effectChanges = [];
+	for (const change of operation.changes) {
+		const event = events.get(change.eventSeq);
+		if (event === void 0) throw new Error("编辑草稿包含不属于目标回合的消息。");
+		if (change.action === "delete") {
+			if (deletedEvents.has(event.seq)) throw new Error("同一条消息被重复删除。");
+			deletedEvents.add(event.seq);
+			const content = event.type === "user/message" ? event.data.content : event.data.message.content;
+			for (const [blockIndex, block] of content.entries()) {
+				if (!isTextualBlock(block)) continue;
+				effectChanges.push({
+					eventSeq: event.seq,
+					blockIndex,
+					blockKind: event.type === "user/message" ? "user" : block.type === "reasoning" ? "assistant.reasoning" : "assistant.response",
+					before: block.text,
+					deleted: true
+				});
+			}
+			continue;
+		}
+		const before = (event.type === "user/message" ? event.data.content : event.data.message.content)[change.blockIndex];
+		if (!isTextualBlock(before)) throw new Error("编辑草稿包含非文本内容块。");
+		if (event.type === "user/message" && before.type !== "text") throw new Error("用户消息只能编辑文本块。");
+		let eventReplacements = replacements.get(event.seq);
+		if (eventReplacements === void 0) {
+			eventReplacements = /* @__PURE__ */ new Map();
+			replacements.set(event.seq, eventReplacements);
+		}
+		if (eventReplacements.has(change.blockIndex)) throw new Error("同一内容块被重复编辑。");
+		eventReplacements.set(change.blockIndex, change.text);
+		effectChanges.push({
+			eventSeq: event.seq,
+			blockIndex: change.blockIndex,
+			blockKind: event.type === "user/message" ? "user" : before.type === "reasoning" ? "assistant.reasoning" : "assistant.response",
+			before: before.text,
+			after: change.text
+		});
+	}
+	for (const eventSeq of replacements.keys()) if (deletedEvents.has(eventSeq)) throw new Error("同一条消息不能同时编辑和删除。");
+	const primaryChange = effectChanges[0];
+	if (primaryChange === void 0) throw new Error("删除的消息没有可记录的文本内容。");
+	const version = pairVersionEffect(operation.sessionId, {
+		operation: "edit",
+		cascade: operation.cascade,
+		targetTurn: turn.turn,
+		targetEventSeq: primaryChange.eventSeq,
+		targetBlockIndex: primaryChange.blockIndex,
+		blockKind: primaryChange.blockKind,
+		before: primaryChange.before,
+		...primaryChange.after === void 0 ? {} : { after: primaryChange.after },
+		changes: effectChanges
+	});
+	const userDeleted = turn.user !== void 0 && deletedEvents.has(turn.user.seq);
+	const editedUser = turn.user === void 0 || userDeleted ? void 0 : cloneUser(turn.user.data, replaceTextBlocks(turn.user.data.content, replacements.get(turn.user.seq) ?? /* @__PURE__ */ new Map()));
+	if (!turn.assistants.some((event) => deletedEvents.has(event.seq) || replacements.has(event.seq)) && !userDeleted) {
+		if (editedUser === void 0) throw new Error("目标回合没有可重新执行的用户输入。");
 		const later = operation.cascade === "preserve" ? downstreamUsers(turns, turnIndex + 1) : [];
 		return {
 			boundary: turn.startSeq - 1,
-			version: pairVersionEffect(operation.sessionId, {
-				operation: "edit",
-				cascade: operation.cascade,
-				targetTurn: turn.turn,
-				targetEventSeq: event.seq,
-				targetBlockIndex: operation.blockIndex,
-				blockKind: "user",
-				before: before.text,
-				after: operation.text
-			}),
-			queuedUsers: [edited, ...later]
+			version,
+			queuedUsers: [editedUser, ...later]
 		};
 	}
-	const before = event.data.message.content[operation.blockIndex];
-	if (!isTextualBlock(before)) throw new Error("所选助手消息块不是文本或思考。");
-	const blockKind = before.type === "reasoning" ? "assistant.reasoning" : "assistant.response";
-	if (turn.user === void 0) throw new Error("所选助手消息没有可重建的用户输入。");
 	return {
 		boundary: turn.startSeq - 1,
-		version: pairVersionEffect(operation.sessionId, {
-			operation: "edit",
-			cascade: operation.cascade,
-			targetTurn: turn.turn,
-			targetEventSeq: event.seq,
-			targetBlockIndex: operation.blockIndex,
-			blockKind,
-			before: before.text,
-			after: operation.text
-		}),
+		version,
 		manualTurn: {
 			turn: turn.turn,
-			user: cloneUser(turn.user.data),
-			assistant: assistantReplacement(event, operation.blockIndex, operation.text)
+			...editedUser === void 0 ? {} : { user: editedUser },
+			assistants: turn.assistants.filter((event) => !deletedEvents.has(event.seq)).map((event) => cloneAssistant(event.data.message, replaceTextBlocks(event.data.message.content, replacements.get(event.seq) ?? /* @__PURE__ */ new Map())))
 		},
 		queuedUsers: operation.cascade === "preserve" ? downstreamUsers(turns, turnIndex + 1) : []
 	};
@@ -267,12 +309,13 @@ function inheritedSeed(source, boundary) {
 	return source.events.slice(0, boundary + 1);
 }
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
-function appendLogSeedEvent(events, type, data) {
+function appendLogSeedEvent(events, type, data, ignorable = false) {
 	events.push({
 		type,
 		seq: events.length,
 		time: Date.now(),
-		data
+		data,
+		...ignorable ? { ignorable: true } : {}
 	});
 }
 function appendSurfaceSeedEvent(events, type, data, intent) {
@@ -286,25 +329,28 @@ function appendSurfaceSeedEvent(events, type, data, intent) {
 	});
 }
 function appendManualTurn(events, manual) {
-	const { turn, user, assistant } = manual;
+	const { turn, user, assistants } = manual;
 	appendLogSeedEvent(events, "turn/start", { turn });
-	appendSurfaceSeedEvent(events, "user/message", user, { surfaceOp: "append" });
-	appendLogSeedEvent(events, "step/start", {
-		turn,
-		step: 1
-	});
-	appendSurfaceSeedEvent(events, "assistant/message", {
-		turn,
-		step: 1,
-		message: assistant
-	}, {
-		surfaceOp: "append",
-		sourceEventSeqs: []
-	});
-	appendLogSeedEvent(events, "step/end", {
-		turn,
-		step: 1
-	});
+	if (user !== void 0) appendSurfaceSeedEvent(events, "user/message", user, { surfaceOp: "append" });
+	for (const [index, assistant] of assistants.entries()) {
+		const step = index + 1;
+		appendLogSeedEvent(events, "step/start", {
+			turn,
+			step
+		});
+		appendSurfaceSeedEvent(events, "assistant/message", {
+			turn,
+			step,
+			message: assistant
+		}, {
+			surfaceOp: "append",
+			sourceEventSeqs: []
+		});
+		appendLogSeedEvent(events, "step/end", {
+			turn,
+			step
+		});
+	}
 	appendLogSeedEvent(events, "turn/end", {
 		turn,
 		reason: { kind: "completed" }
@@ -313,7 +359,7 @@ function appendManualTurn(events, manual) {
 function versionSeed(source, plan) {
 	const events = inheritedSeed(source, plan.boundary);
 	const inheritedLength = events.length;
-	appendLogSeedEvent(events, "message-edit/version", plan.version);
+	appendLogSeedEvent(events, "message-edit/version", plan.version, true);
 	if (plan.manualTurn !== void 0) appendManualTurn(events, plan.manualTurn);
 	return {
 		events,
@@ -458,51 +504,12 @@ function flattenLineage(root, descendants) {
 	visit(descendants, 1);
 	return result;
 }
-/** Bounded parallel inspection of persisted branches; matches the corpus worker shape. */
-const TIMELINE_READ_CONCURRENCY = 4;
-async function mapConcurrent(items, worker) {
-	const results = new Array(items.length);
-	let cursor = 0;
-	const run = async () => {
-		for (;;) {
-			const index = cursor;
-			cursor += 1;
-			if (index >= items.length) return;
-			results[index] = await worker(items[index]);
-		}
-	};
-	const workers = Math.min(TIMELINE_READ_CONCURRENCY, items.length);
-	await Promise.all(Array.from({ length: workers }, () => run()));
-	return results;
-}
-/** Full log for the requested session: live borrow, persisted inspection, query fallback. */
-async function readCurrentLog(ctx, sessionId) {
-	const live = ctx.sessions.get(sessionId);
-	if (live !== void 0) return live.events;
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.inspect(sessionId)).events;
-	return (await ctx.sessionQuery.readSession(sessionId)).events;
-}
-/** Own-version scan window for one lineage node: the tail from the durable
-* seed boundary is enough, and root nodes cannot carry a version effect. */
-async function versionLog(ctx, record) {
-	const inherited = record.header.seedLength ?? 0;
-	const live = ctx.sessions.get(record.header.id);
-	if (live !== void 0) return live.events.slice(inherited);
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.readFrom(record.header.id, inherited)).events;
-	return (await ctx.sessionQuery.readSession(record.header.id)).events.slice(inherited);
-}
 async function timeline(ctx, sessionId) {
 	const targetTrace = await ctx.sessionQuery.traceSession(sessionId);
 	const rootId = targetTrace.complete ? targetTrace.root.header.id : targetTrace.ancestors.at(-1)?.header.id ?? sessionId;
 	const rootTrace = rootId === sessionId ? targetTrace : await ctx.sessionQuery.traceSession(rootId);
 	const lineage = flattenLineage(rootTrace.target, rootTrace.descendants);
-	const logs = await mapConcurrent(lineage, async ({ record }) => {
-		if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId);
-		if (record.header.parentSession === void 0) return [];
-		return versionLog(ctx, record);
-	});
+	const logs = await Promise.all(lineage.map(({ record }) => ctx.sessionQuery.readSession(record.header.id)));
 	const recordsById = new Map(lineage.map(({ record }) => [record.header.id, record]));
 	const currentPath = /* @__PURE__ */ new Set();
 	let pathId = sessionId;
@@ -511,7 +518,7 @@ async function timeline(ctx, sessionId) {
 		pathId = recordsById.get(pathId)?.header.parentSession;
 	}
 	const versions = lineage.map(({ record, depth }, index) => {
-		const version = ownVersionEvent(record.header, logs[index] ?? []);
+		const version = ownVersionEvent(record.header, logs[index]?.events ?? []);
 		return {
 			sessionId: record.header.id,
 			...record.header.parentSession === void 0 ? {} : { parentSessionId: record.header.parentSession },
@@ -553,7 +560,7 @@ async function timeline(ctx, sessionId) {
 	const currentIndex = versions.findIndex((version) => version.current);
 	const currentLog = logs[currentIndex];
 	if (currentIndex < 0 || currentLog === void 0) throw new Error("当前版本不在版本树中。");
-	const turns = closedTurns(currentLog);
+	const turns = closedTurns(currentLog.events);
 	return {
 		sessionId,
 		messages: editableMessages(turns),
@@ -583,16 +590,13 @@ function decodeOperation(value) {
 	const record = objectValue(value);
 	const sessionId = sessionIdOf(record["sessionId"]);
 	switch (record["action"]) {
-		case "edit":
-			if (typeof record["text"] !== "string") throw new TypeError("text 必须是字符串。");
-			return {
-				action: "edit",
-				sessionId,
-				eventSeq: integerOf(record["eventSeq"], "eventSeq"),
-				blockIndex: integerOf(record["blockIndex"], "blockIndex"),
-				text: record["text"],
-				cascade: cascadeOf(record["cascade"])
-			};
+		case "edit": return {
+			action: "edit",
+			sessionId,
+			turn: integerOf(record["turn"], "turn"),
+			changes: editChangesOf(record["changes"]),
+			cascade: cascadeOf(record["cascade"])
+		};
 		case "reroll": return {
 			action: "reroll",
 			sessionId
@@ -605,6 +609,27 @@ function decodeOperation(value) {
 		};
 		default: throw new TypeError("action 必须是 edit、reroll 或 retry。");
 	}
+}
+function editChangesOf(value) {
+	if (!Array.isArray(value) || value.length === 0) throw new TypeError("changes 必须是非空数组。");
+	return value.map((item, index) => {
+		const record = objectValue(item);
+		const eventSeq = integerOf(record["eventSeq"], `changes[${String(index)}].eventSeq`);
+		if (record["action"] === "delete") return {
+			action: "delete",
+			eventSeq
+		};
+		if (record["action"] === "replace") {
+			if (typeof record["text"] !== "string") throw new TypeError(`changes[${String(index)}].text 必须是字符串。`);
+			return {
+				action: "replace",
+				eventSeq,
+				blockIndex: integerOf(record["blockIndex"], `changes[${String(index)}].blockIndex`),
+				text: record["text"]
+			};
+		}
+		throw new TypeError(`changes[${String(index)}].action 必须是 replace 或 delete。`);
+	});
 }
 function requestJson(request) {
 	return new Promise((resolve, reject) => {

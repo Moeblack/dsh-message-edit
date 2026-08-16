@@ -52,6 +52,28 @@
   cursor: pointer;
 }
 
+.footer .primaryButton,
+.footer .dangerButton {
+  border-color: transparent;
+  color: var(--dsw-alias-label-primary-foreground);
+}
+
+.footer .primaryButton {
+  background: var(--dsw-alias-button-primary-fill);
+}
+
+.footer .primaryButton:hover:not(:disabled) {
+  background: var(--dsw-alias-button-primary-hover);
+}
+
+.footer .dangerButton {
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 68%, var(--dsw-alias-label-tertiary));
+}
+
+.footer .dangerButton:hover:not(:disabled) {
+  opacity: 0.86;
+}
+
 .iconButton {
   display: inline-flex;
   align-items: center;
@@ -70,6 +92,7 @@
   color: var(--dsw-alias-label-primary);
   background: var(--dsw-alias-bg-module-hover);
 }
+
 
 .picker {
   display: flex;

@@ -4,7 +4,12 @@
 [![npm downloads](https://img.shields.io/npm/dm/dsh-message-edit)](https://www.npmjs.com/package/dsh-message-edit)
 [![license](https://img.shields.io/npm/l/dsh-message-edit)](LICENSE)
 
-`dsh-message-edit`（[npm](https://www.npmjs.com/package/dsh-message-edit) · [GitHub](https://github.com/Moeblack/dsh-message-edit)）为 DeepSeek Harness 补充基于事件溯源的「消息编辑与重生成」能力。插件不改写历史事件，也不修改 DSH 引擎内部；每次编辑、重生成或重试都会从目标回合之前创建一个新会话版本，原会话始终保留并可随时切回。
+`dsh-message-edit`（[npm](https://www.npmjs.com/package/dsh-message-edit) · [GitHub](https://github.com/Moeblack/dsh-message-edit)）为 DeepSeek Harness 补充基于事件溯源的「消息编辑与重生成」能力。编辑先写入当前会话的浏览器草稿，不会改写历史或创建分支；只有「保存并重新生成」、重生成或重试才会从目标回合之前创建一个新会话版本，原会话始终保留并可随时切回。
+
+本版本的两个核心改进：
+
+- **保存**只写入本地草稿缓存，可以继续编辑同一回合的其他消息；**保存并重新生成**才真正创建分支。
+- 新增红色**删除**按钮，可将整条用户或助手消息从新分支中真正移除，而不是改成空消息。
 
 ```bash
 dsh plugin --profile web add dsh-message-edit
@@ -12,7 +17,9 @@ dsh plugin --profile web add dsh-message-edit
 
 ## 功能
 
-- **编辑消息**：可编辑已落定的用户文本、`assistant.reasoning` 思考块与 `assistant.response` 回复文本。
+- **编辑草稿**：可先后保存已落定的用户文本、`assistant.reasoning` 思考块与 `assistant.response` 回复文本到当前会话草稿；可以继续编辑同回合的其他消息，不会建立分支。
+- **一次提交**：点击「保存并重新生成」时，同回合的全部草稿变更会被原子提交为一个分支。
+- **删除消息**：红色「删除」只暂存整条用户或助手消息的删除意图；提交后该消息在新分支中完全不存在，而不是空文本消息。
 - **重生成**：从最后一条已落定助手回复所属回合之前分支，使用原用户输入重新生成。
 - **重试任意回合**：在 Timeline 中选择任意历史回合重新执行。
 - **级联策略**：
@@ -27,8 +34,8 @@ dsh plugin --profile web add dsh-message-edit
 
 插件把**完整回合**作为效果原子。目标回合的 `turn/start`、模型请求、工具调用、工具结果与 `turn/end` 不会被局部复制后拼接；新版本从该回合之前的闭合边界分支：
 
-1. 用户消息编辑、Reroll 与 Retry：回退整个目标回合，再把目标用户输入作为新回合交给 Agent。
-2. 助手块编辑：回退整个目标回合，以原用户输入和编辑后的助手内容构造一个新的完整闭合回合；原工具链不进入新版本。选择 `preserve` 时，后续用户输入再依次交给 Agent，产生新的完整工具链。
+1. 编辑操作先停留在 Browser 的 session-local 草稿缓存中，以消息事件序号和内容块序号定位；保存草稿不请求 Host，也不创建 Session。
+2. 「保存并重新生成」把同一目标回合内的全部替换和整条消息删除合并为一个 `edit` 效果。用户消息编辑会把目标输入交给 Agent；助手消息编辑或用户消息删除则以保留后的消息构造新的完整闭合回合。选择 `preserve` 时，后续用户输入再依次交给 Agent，产生新的完整工具链。
 3. 每个版本都追加一个不可拆分的 `message-edit/version` 效果对：`effect` 记录正向效果，`inverse` 记录恢复目标。父版本链自动导出组合逆；恢复不是删除事件，而是沿逆链切换到仍然存在的版本。
 4. 消息历史变换彼此不交换，因此撤销遵循 LIFO：一次只撤销当前原子效果并保留更早效果；各后继分支始终保留，可从父版本重新施加。
 
@@ -119,7 +126,7 @@ dsh plugin --profile web add -w link:/path/to/dsh-message-edit
 ## HTTP 接口
 
 - `GET /message-edit?sessionId=<id>`：读取可编辑消息、可重试回合与完整版本树。
-- `POST /message-edit`：执行 `edit`、`reroll` 或 `retry`，返回已发布的新 Session ID。
+- `POST /message-edit`：执行 `edit`、`reroll` 或 `retry`，返回已发布的新 Session ID。`edit` 接收一个目标回合及其完整草稿变更列表，Host 一次创建一个分支。
 
 ## 范围边界
 

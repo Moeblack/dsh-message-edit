@@ -12,8 +12,6 @@ window.__ModuleLoader__.load({
 		const MESSAGE_EDIT_PATH = "/message-edit";
 		//#endregion
 		//#region src/client/controller.ts
-		/** Merge a burst of turn completions into one refresh. */
-		const REFRESH_DELAY_MS = 300;
 		function messageOf(error) {
 			return error instanceof Error ? error.message : String(error);
 		}
@@ -53,9 +51,10 @@ window.__ModuleLoader__.load({
 			const row = objectValue(value, `retryableTurns[${String(index)}]`);
 			return {
 				turn: numberValue(row["turn"], "回合 turn"),
-				userEventSeq: numberValue(row["userEventSeq"], "回合 userEventSeq"),
+				...row["userEventSeq"] === void 0 ? {} : { userEventSeq: numberValue(row["userEventSeq"], "回合 userEventSeq") },
 				preview: stringValue(row["preview"], "回合 preview"),
-				time: numberValue(row["time"], "回合 time")
+				time: numberValue(row["time"], "回合 time"),
+				retryable: booleanValue(row["retryable"], "回合 retryable")
 			};
 		}
 		function optionalOperation(value) {
@@ -111,6 +110,21 @@ window.__ModuleLoader__.load({
 				queuedTurns: numberValue(data["queuedTurns"], "操作 queuedTurns")
 			};
 		}
+		function emptyDrafts() {
+			return {
+				textByKey: {},
+				deletedEventSeqs: []
+			};
+		}
+		function pruneDrafts(drafts, timeline) {
+			const messagesByKey = new Map(timeline.messages.map((message) => [message.key, message]));
+			const textByKey = Object.fromEntries(Object.entries(drafts.textByKey).filter(([key, text]) => messagesByKey.get(key)?.text !== void 0 && messagesByKey.get(key)?.text !== text));
+			const messageEventSeqs = new Set(timeline.messages.map((message) => message.eventSeq));
+			return {
+				textByKey,
+				deletedEventSeqs: drafts.deletedEventSeqs.filter((eventSeq) => messageEventSeqs.has(eventSeq))
+			};
+		}
 		async function responseValue(response) {
 			const value = await response.json();
 			if (response.ok) return value;
@@ -158,48 +172,38 @@ window.__ModuleLoader__.load({
 				status: "idle",
 				error: null,
 				pending: null,
-				timeline: null
+				timeline: null,
+				drafts: emptyDrafts()
 			});
 			face;
 			generation = 0;
-			ctx;
 			sessions;
 			sessionSource;
 			sessionSourceDispose;
 			sessionRevision;
 			listRevision = "";
 			refreshScheduled = false;
-			refreshTimer;
 			observing = false;
 			navigationWaits = /* @__PURE__ */ new Set();
-			disposeObservation = void 0;
-			inflight = null;
-			rerunAfter = false;
-			abort = null;
-			disposed = false;
-			users = 0;
 			constructor(ctx, sessionId) {
 				this.sessionId = sessionId;
-				this.ctx = ctx;
 				this.sessions = ctx.get("sessions");
 				this.face = {
 					hooks: { messageEdit: this.store },
-					acquire: () => {
-						this.users += 1;
-						if (this.users === 1 && this.disposed) this.revive();
-						return () => this.release();
-					},
 					load: () => {
 						this.load();
 					},
-					edit: (message, text, cascade) => this.mutate({
-						action: "edit",
-						sessionId: this.sessionId,
-						eventSeq: message.eventSeq,
-						blockIndex: message.blockIndex,
-						text,
-						cascade
-					}),
+					save: (message, text) => {
+						this.saveDraft(message, text);
+					},
+					delete: (message) => {
+						this.deleteDraft(message);
+					},
+					restore: (message) => {
+						this.restoreDraft(message);
+					},
+					commit: (message, text, cascade) => this.commitDraft(message, text, cascade),
+					commitTurn: (turn, cascade) => this.commitTurn(turn, cascade),
 					retry: (turn, cascade) => this.mutate({
 						action: "retry",
 						sessionId: this.sessionId,
@@ -212,36 +216,7 @@ window.__ModuleLoader__.load({
 					}),
 					openVersion: (sessionId) => this.openWhenListed(sessionId)
 				};
-				this.observe();
-			}
-			observe() {
-				this.disposeObservation = this.ctx.effect(() => this.observeDependencies(), `message-edit: observe ${this.sessionId}`);
-			}
-			release() {
-				this.users -= 1;
-				if (this.users <= 0) this.dispose();
-			}
-			/** Tear subscriptions down once no mounted entry uses this controller. */
-			dispose() {
-				if (this.disposed) return;
-				this.disposed = true;
-				this.generation += 1;
-				if (this.refreshTimer !== void 0) {
-					clearTimeout(this.refreshTimer);
-					this.refreshTimer = void 0;
-					this.refreshScheduled = false;
-				}
-				this.abort?.abort();
-				this.abort = null;
-				this.disposeObservation?.();
-				this.disposeObservation = void 0;
-			}
-			/** Re-observe after a transient zero; the retained store keeps old data
-			* until the immediate refetch below commits. */
-			revive() {
-				this.disposed = false;
-				this.observe();
-				this.refresh();
+				ctx.effect(() => this.observeDependencies(), `message-edit: observe ${sessionId}`);
 			}
 			/** Bind to replaceable value sources instead of retaining a Session object. */
 			observeDependencies() {
@@ -284,60 +259,30 @@ window.__ModuleLoader__.load({
 			invalidate() {
 				if (!this.observing || this.store.getSnapshot().status === "idle" || this.refreshScheduled) return;
 				this.refreshScheduled = true;
-				this.refreshTimer = setTimeout(() => {
-					this.refreshTimer = void 0;
+				queueMicrotask(() => {
 					this.refreshScheduled = false;
-					if (this.observing && this.store.getSnapshot().status !== "idle") this.refresh();
-				}, REFRESH_DELAY_MS);
+					if (this.observing && this.store.getSnapshot().status !== "idle") this.load();
+				});
 			}
-			/** Invalidation-driven refetch: one in-flight request absorbs the demand
-			* and commits a single rerun once it settles. */
-			refresh() {
-				if (this.disposed) return;
-				if (this.inflight !== null) {
-					this.rerunAfter = true;
-					return;
-				}
-				this.load();
-			}
-			/** Refetch the full value-level projection; concurrent callers share one
-			* request, and an invalidation during flight schedules exactly one rerun. */
+			/** Refetch the full value-level projection; only the newest request commits. */
 			async load() {
-				if (this.disposed) return;
-				if (this.inflight !== null) return this.inflight;
 				const generation = ++this.generation;
-				this.abort?.abort();
-				const abort = new AbortController();
-				this.abort = abort;
 				this.store.update((state) => {
 					state.status = "loading";
 					state.error = null;
 				});
-				const run = this.performLoad(generation, abort);
-				this.inflight = run;
-				try {
-					await run;
-				} finally {
-					if (this.inflight === run) this.inflight = null;
-					if (this.rerunAfter && !this.disposed) {
-						this.rerunAfter = false;
-						this.load();
-					}
-				}
-			}
-			async performLoad(generation, abort) {
 				try {
 					const timeline = decodeTimeline(await responseValue(await fetch(`${MESSAGE_EDIT_PATH}?sessionId=${encodeURIComponent(this.sessionId)}`, {
 						method: "GET",
 						headers: { accept: "application/json" },
-						cache: "no-store",
-						signal: abort.signal
+						cache: "no-store"
 					})));
 					if (generation !== this.generation) return;
 					this.store.update((state) => {
 						state.status = "ready";
 						state.error = null;
 						state.timeline = timeline;
+						state.drafts = pruneDrafts(state.drafts, timeline);
 					});
 				} catch (error) {
 					if (generation !== this.generation) return;
@@ -349,8 +294,107 @@ window.__ModuleLoader__.load({
 			}
 			/** Refresh only controllers whose projection has already been requested. */
 			refreshIfLoaded() {
-				if (this.disposed || this.store.getSnapshot().status === "idle") return;
-				this.refresh();
+				if (this.store.getSnapshot().status !== "idle") this.load();
+			}
+			saveDraft(message, text) {
+				this.store.update((state) => {
+					const timeline = state.timeline;
+					if (timeline === null || !timeline.messages.some((candidate) => candidate.key === message.key)) {
+						state.error = "要保存的消息已不在当前会话中。";
+						return;
+					}
+					const textByKey = { ...state.drafts.textByKey };
+					if (text === message.text) delete textByKey[message.key];
+					else textByKey[message.key] = text;
+					state.drafts = {
+						...state.drafts,
+						textByKey
+					};
+					state.error = null;
+				});
+			}
+			deleteDraft(message) {
+				this.store.update((state) => {
+					const textByKey = { ...state.drafts.textByKey };
+					for (const key of Object.keys(textByKey)) if (key.startsWith(`${String(message.eventSeq)}:`)) delete textByKey[key];
+					state.drafts = {
+						textByKey,
+						deletedEventSeqs: [.../* @__PURE__ */ new Set([...state.drafts.deletedEventSeqs, message.eventSeq])]
+					};
+					state.error = null;
+				});
+			}
+			restoreDraft(message) {
+				this.store.update((state) => {
+					state.drafts = {
+						...state.drafts,
+						deletedEventSeqs: state.drafts.deletedEventSeqs.filter((eventSeq) => eventSeq !== message.eventSeq)
+					};
+					state.error = null;
+				});
+			}
+			draftChangesForTurn(turn) {
+				const state = this.store.getSnapshot();
+				const timeline = state.timeline;
+				if (timeline === null) return void 0;
+				const deleted = new Set(state.drafts.deletedEventSeqs);
+				const deletedAdded = /* @__PURE__ */ new Set();
+				const changes = [];
+				for (const message of timeline.messages) {
+					if (message.turn !== turn) continue;
+					if (deleted.has(message.eventSeq)) {
+						if (!deletedAdded.has(message.eventSeq)) {
+							changes.push({
+								action: "delete",
+								eventSeq: message.eventSeq
+							});
+							deletedAdded.add(message.eventSeq);
+						}
+						continue;
+					}
+					const text = state.drafts.textByKey[message.key];
+					if (text !== void 0 && text !== message.text) changes.push({
+						action: "replace",
+						eventSeq: message.eventSeq,
+						blockIndex: message.blockIndex,
+						text
+					});
+				}
+				return changes;
+			}
+			async commitDraft(message, text, cascade) {
+				this.saveDraft(message, text);
+				return this.commitTurn(message.turn, cascade);
+			}
+			async commitTurn(turn, cascade) {
+				const changes = this.draftChangesForTurn(turn);
+				if (changes === void 0) return false;
+				if (changes.length === 0) {
+					this.store.update((state) => {
+						state.error = "此回合没有已保存的编辑草稿。";
+					});
+					return false;
+				}
+				const applied = await this.mutate({
+					action: "edit",
+					sessionId: this.sessionId,
+					turn,
+					changes,
+					cascade
+				});
+				if (applied) this.clearTurnDraft(turn);
+				return applied;
+			}
+			clearTurnDraft(turn) {
+				this.store.update((state) => {
+					const messages = state.timeline?.messages.filter((message) => message.turn === turn) ?? [];
+					const keys = new Set(messages.map((message) => message.key));
+					const eventSeqs = new Set(messages.map((message) => message.eventSeq));
+					state.drafts = {
+						textByKey: Object.fromEntries(Object.entries(state.drafts.textByKey).filter(([key]) => !keys.has(key))),
+						deletedEventSeqs: state.drafts.deletedEventSeqs.filter((eventSeq) => !eventSeqs.has(eventSeq))
+					};
+				});
 			}
 			async mutate(operation) {
 				const current = this.store.getSnapshot();
@@ -368,14 +412,12 @@ window.__ModuleLoader__.load({
 						},
 						body: JSON.stringify(operation)
 					})));
-					if (this.disposed) return true;
 					this.store.update((state) => {
 						state.pending = null;
 					});
 					await this.openWhenListed(result.sessionId);
 					return true;
 				} catch (error) {
-					if (this.disposed) return false;
 					this.store.update((state) => {
 						state.pending = null;
 						state.error = messageOf(error);
@@ -413,8 +455,8 @@ window.__ModuleLoader__.load({
 			}
 		};
 		//#endregion
-		//#region \0dsh-css:/home/moeblack/repos/dsh-message-edit/src/client/InlineMessageEdit.module.css.mjs
-		const css$2 = ".Kad6XG_overlay{z-index:1000;background:var(--dsw-alias-bg-mask,#00000073);justify-content:center;align-items:center;display:flex;position:fixed;inset:0}.Kad6XG_panel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);border-radius:10px;width:560px;padding:14px 16px}.Kad6XG_title{color:var(--dsw-alias-label-primary);padding:4px 0 10px;font-size:13px}.Kad6XG_input{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);width:100%;min-height:160px;color:var(--dsw-alias-label-primary);font:inherit;resize:vertical;border-radius:8px;padding:10px}.Kad6XG_footer{justify-content:flex-end;gap:8px;padding:10px 0 0;display:flex}.Kad6XG_footer button{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;padding:6px 14px}.Kad6XG_iconButton{width:20px;height:20px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:none;border-radius:4px;justify-content:center;align-items:center;padding:2px;display:inline-flex}.Kad6XG_iconButton:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-hover)}.Kad6XG_picker{flex-direction:column;gap:6px;padding:4px 0 12px;display:flex}.Kad6XG_pickerItem{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);text-align:left;cursor:pointer;border-radius:6px;padding:8px 10px;font-size:12px}.Kad6XG_pickerItem:hover{background:var(--dsw-alias-bg-module-platform)}.Kad6XG_pickerItemActive{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;align-self:flex-end;padding:6px 14px}";
+		//#region \0dsh-css:D:\AI\code\dsh-message-edit-main\src\client\InlineMessageEdit.module.css.mjs
+		const css$2 = ".ZcaxqG_overlay{z-index:1000;background:var(--dsw-alias-bg-mask,#00000073);justify-content:center;align-items:center;display:flex;position:fixed;inset:0}.ZcaxqG_panel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);border-radius:10px;width:560px;padding:14px 16px}.ZcaxqG_title{color:var(--dsw-alias-label-primary);padding:4px 0 10px;font-size:13px}.ZcaxqG_input{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);width:100%;min-height:160px;color:var(--dsw-alias-label-primary);font:inherit;resize:vertical;border-radius:8px;padding:10px}.ZcaxqG_footer{justify-content:flex-end;gap:8px;padding:10px 0 0;display:flex}.ZcaxqG_footer button{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;padding:6px 14px}.ZcaxqG_footer .ZcaxqG_primaryButton,.ZcaxqG_footer .ZcaxqG_dangerButton{color:var(--dsw-alias-label-primary-foreground);border-color:#0000}.ZcaxqG_footer .ZcaxqG_primaryButton{background:var(--dsw-alias-button-primary-fill)}.ZcaxqG_footer .ZcaxqG_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.ZcaxqG_footer .ZcaxqG_dangerButton{background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 68%, var(--dsw-alias-label-tertiary))}.ZcaxqG_footer .ZcaxqG_dangerButton:hover:not(:disabled){opacity:.86}.ZcaxqG_iconButton{width:20px;height:20px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:none;border-radius:4px;justify-content:center;align-items:center;padding:2px;display:inline-flex}.ZcaxqG_iconButton:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-hover)}.ZcaxqG_picker{flex-direction:column;gap:6px;padding:4px 0 12px;display:flex}.ZcaxqG_pickerItem{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);text-align:left;cursor:pointer;border-radius:6px;padding:8px 10px;font-size:12px}.ZcaxqG_pickerItem:hover{background:var(--dsw-alias-bg-module-platform)}.ZcaxqG_pickerItemActive{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;align-self:flex-end;padding:6px 14px}";
 		const tagId$2 = "dsh-message-edit/InlineMessageEdit.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId$2) + "]") === null) {
 			const tag = document.createElement("style");
@@ -424,15 +466,17 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var InlineMessageEdit_module_css_default = {
-			"panel": "Kad6XG_panel",
-			"overlay": "Kad6XG_overlay",
-			"title": "Kad6XG_title",
-			"iconButton": "Kad6XG_iconButton",
-			"picker": "Kad6XG_picker",
-			"pickerItem": "Kad6XG_pickerItem",
-			"pickerItemActive": "Kad6XG_pickerItemActive",
-			"input": "Kad6XG_input",
-			"footer": "Kad6XG_footer"
+			"primaryButton": "ZcaxqG_primaryButton",
+			"title": "ZcaxqG_title",
+			"overlay": "ZcaxqG_overlay",
+			"picker": "ZcaxqG_picker",
+			"pickerItem": "ZcaxqG_pickerItem",
+			"footer": "ZcaxqG_footer",
+			"pickerItemActive": "ZcaxqG_pickerItemActive",
+			"input": "ZcaxqG_input",
+			"dangerButton": "ZcaxqG_dangerButton",
+			"panel": "ZcaxqG_panel",
+			"iconButton": "ZcaxqG_iconButton"
 		};
 		//#endregion
 		//#region src/client/InlineMessageEdit.tsx
@@ -457,7 +501,9 @@ window.__ModuleLoader__.load({
 			iconButton: InlineMessageEdit_module_css_default["iconButton"] ?? "",
 			picker: InlineMessageEdit_module_css_default["picker"] ?? "",
 			pickerItem: InlineMessageEdit_module_css_default["pickerItem"] ?? "",
-			pickerItemActive: InlineMessageEdit_module_css_default["pickerItemActive"] ?? ""
+			pickerItemActive: InlineMessageEdit_module_css_default["pickerItemActive"] ?? "",
+			primaryButton: InlineMessageEdit_module_css_default["primaryButton"] ?? "",
+			dangerButton: InlineMessageEdit_module_css_default["dangerButton"] ?? ""
 		};
 		/** Official ic_ds_refresh_outline_16 path (dsh-client-ui-primitives). */
 		const REFRESH_PATH = "M7.92136 0.349152C10.3744 0.349234 12.5564 1.5052 13.9557 3.29894L15.1281 2.12759C15.3303 1.92546 15.6767 2.06943 15.6767 2.35538V5.53923C15.6766 5.71626 15.5329 5.85976 15.3559 5.86002H12.171C11.8854 5.8597 11.7426 5.51465 11.9443 5.31249L12.9641 4.29056C11.8237 2.74305 9.98908 1.74106 7.92136 1.74097C4.46436 1.74097 1.66233 4.543 1.66233 8C1.66233 11.457 4.46436 14.259 7.92136 14.259C11.3782 14.2589 14.1804 11.4569 14.1804 8H15.5722C15.5722 12.2251 12.1465 15.6507 7.92136 15.6508C3.69614 15.6508 0.270508 12.2252 0.270508 8C0.270508 3.77478 3.69614 0.349152 7.92136 0.349152Z";
@@ -479,7 +525,7 @@ window.__ModuleLoader__.load({
 			return BLOCK_TITLE[kind] ?? "编辑消息";
 		}
 		/** Mount one editor DOM effect and return its exact inverse. */
-		function mountEditor(block, edit, close) {
+		function mountEditor(block, text, saveDraft, deleteDraft, commit, close) {
 			const overlay = document.createElement("div");
 			overlay.className = STYLE.overlay;
 			const panel = document.createElement("div");
@@ -489,34 +535,54 @@ window.__ModuleLoader__.load({
 			title.textContent = blockTitle(block.kind);
 			const input = document.createElement("textarea");
 			input.className = STYLE.input;
-			input.value = block.text;
+			input.value = text;
 			const footer = document.createElement("div");
 			footer.className = STYLE.footer;
 			const save = document.createElement("button");
 			save.textContent = "保存";
+			const apply = document.createElement("button");
+			apply.className = STYLE.primaryButton;
+			apply.textContent = "保存并重新生成";
+			const remove = document.createElement("button");
+			remove.className = STYLE.dangerButton;
+			remove.textContent = "删除";
 			const cancel = document.createElement("button");
 			cancel.textContent = "取消";
-			footer.append(save, cancel);
+			footer.append(save);
+			footer.append(remove);
+			footer.append(apply, cancel);
 			panel.append(title, input, footer);
 			overlay.appendChild(panel);
 			document.body.appendChild(overlay);
 			input.focus();
 			input.setSelectionRange(input.value.length, input.value.length);
 			let mounted = true;
-			let saving = false;
+			let committing = false;
 			const saveEdit = () => {
-				if (saving) return;
-				saving = true;
+				if (committing) return;
+				saveDraft(block, input.value);
+				close();
+			};
+			const commitEdit = () => {
+				if (committing) return;
+				committing = true;
 				save.disabled = true;
-				edit(block, input.value, "truncate").then((applied) => {
+				apply.disabled = true;
+				commit(block, input.value, "truncate").then((applied) => {
 					if (!mounted) return;
 					if (applied) {
 						close();
 						return;
 					}
-					saving = false;
+					committing = false;
 					save.disabled = false;
+					apply.disabled = false;
 				});
+			};
+			const deleteEdit = () => {
+				if (committing) return;
+				deleteDraft(block);
+				close();
 			};
 			const cancelEdit = () => {
 				close();
@@ -525,11 +591,15 @@ window.__ModuleLoader__.load({
 				if (event.target === overlay) close();
 			};
 			save.addEventListener("click", saveEdit);
+			remove.addEventListener("click", deleteEdit);
+			apply.addEventListener("click", commitEdit);
 			cancel.addEventListener("click", cancelEdit);
 			overlay.addEventListener("click", dismiss);
 			return () => {
 				mounted = false;
 				save.removeEventListener("click", saveEdit);
+				remove.removeEventListener("click", deleteEdit);
+				apply.removeEventListener("click", commitEdit);
 				cancel.removeEventListener("click", cancelEdit);
 				overlay.removeEventListener("click", dismiss);
 				overlay.remove();
@@ -578,7 +648,7 @@ window.__ModuleLoader__.load({
 			};
 		}
 		/** Compose every overlay with a single idempotent active inverse. */
-		function createOverlayHost(edit) {
+		function createOverlayHost(saveDraft, deleteDraft, commit, drafts) {
 			let active;
 			const mount = (effect) => {
 				active?.();
@@ -600,7 +670,7 @@ window.__ModuleLoader__.load({
 				}
 			};
 			const editBlock = (block) => {
-				mount((close) => mountEditor(block, edit, close));
+				mount((close) => mountEditor(block, drafts.textByKey[block.key] ?? block.text, saveDraft, deleteDraft, commit, close));
 			};
 			const chooseBlock = (blocks) => {
 				mount((close) => mountPicker(blocks, (block) => {
@@ -617,14 +687,11 @@ window.__ModuleLoader__.load({
 			};
 		}
 		/** Inject retry + edit icon buttons into each message action row. */
-		function InlineMessageEdit({ messages, edit, retry }) {
+		function InlineMessageEdit({ messages, drafts, save, delete: deleteDraft, commit, retry }) {
 			(0, react.useEffect)(() => {
 				const cleanups = [];
-				const overlays = createOverlayHost(edit);
+				const overlays = createOverlayHost(save, deleteDraft, commit, drafts);
 				let observer;
-				let alive = true;
-				let frame;
-				let scheduled = false;
 				const sync = () => {
 					const actionRows = Array.from(document.querySelectorAll("[class*=\"actions\"]"));
 					const claimedEvents = /* @__PURE__ */ new Set();
@@ -686,36 +753,29 @@ window.__ModuleLoader__.load({
 					}
 				};
 				sync();
-				observer = new MutationObserver(() => {
-					if (!alive || scheduled) return;
-					scheduled = true;
-					frame = requestAnimationFrame(() => {
-						frame = void 0;
-						scheduled = false;
-						if (alive) sync();
-					});
-				});
+				observer = new MutationObserver(sync);
 				observer.observe(document.body, {
 					childList: true,
 					subtree: true
 				});
 				return () => {
-					alive = false;
-					if (frame !== void 0) cancelAnimationFrame(frame);
 					observer?.disconnect();
 					overlays.dispose();
 					for (const cleanup of cleanups.reverse()) cleanup();
 				};
 			}, [
 				messages,
-				edit,
+				drafts,
+				save,
+				deleteDraft,
+				commit,
 				retry
 			]);
 			return null;
 		}
 		//#endregion
-		//#region \0dsh-css:/home/moeblack/repos/dsh-message-edit/src/client/MessageEditHeader.module.css.mjs
-		const css$1 = ".nFunOq_root{align-items:center;gap:4px;display:inline-flex}.nFunOq_iconButton,.nFunOq_rerollButton{box-sizing:border-box;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;background:0 0;border:0}.nFunOq_iconButton{border-radius:50%;justify-content:center;align-items:center;width:28px;height:28px;font-size:16px;line-height:20px;display:inline-flex}.nFunOq_rerollButton{border:1px solid var(--dsw-alias-border-l2);border-radius:14px;height:28px;padding:0 10px;font-size:12px;line-height:18px}.nFunOq_iconButton:hover:not(:disabled),.nFunOq_rerollButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.nFunOq_iconButton:focus-visible,.nFunOq_rerollButton:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.nFunOq_iconButton:disabled,.nFunOq_rerollButton:disabled{cursor:default;opacity:.4}.nFunOq_counter{min-width:108px;color:var(--dsw-alias-label-tertiary);text-align:center;font-size:11px;line-height:18px}@media (width<=760px){.nFunOq_counter{display:none}}";
+		//#region \0dsh-css:D:\AI\code\dsh-message-edit-main\src\client\MessageEditHeader.module.css.mjs
+		const css$1 = ".ewxxhq_root{align-items:center;gap:4px;display:inline-flex}.ewxxhq_iconButton,.ewxxhq_rerollButton{box-sizing:border-box;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;background:0 0;border:0}.ewxxhq_iconButton{border-radius:50%;justify-content:center;align-items:center;width:28px;height:28px;font-size:16px;line-height:20px;display:inline-flex}.ewxxhq_rerollButton{border:1px solid var(--dsw-alias-border-l2);border-radius:14px;height:28px;padding:0 10px;font-size:12px;line-height:18px}.ewxxhq_iconButton:hover:not(:disabled),.ewxxhq_rerollButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.ewxxhq_iconButton:focus-visible,.ewxxhq_rerollButton:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.ewxxhq_iconButton:disabled,.ewxxhq_rerollButton:disabled{cursor:default;opacity:.4}.ewxxhq_counter{min-width:108px;color:var(--dsw-alias-label-tertiary);text-align:center;font-size:11px;line-height:18px}@media (width<=760px){.ewxxhq_counter{display:none}}";
 		const tagId$1 = "dsh-message-edit/MessageEditHeader.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId$1) + "]") === null) {
 			const tag = document.createElement("style");
@@ -725,21 +785,19 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditHeader_module_css_default = {
-			"root": "nFunOq_root",
-			"counter": "nFunOq_counter",
-			"iconButton": "nFunOq_iconButton",
-			"rerollButton": "nFunOq_rerollButton"
+			"iconButton": "ewxxhq_iconButton",
+			"rerollButton": "ewxxhq_rerollButton",
+			"root": "ewxxhq_root",
+			"counter": "ewxxhq_counter"
 		};
 		//#endregion
 		//#region src/client/MessageEditHeader.tsx
 		/** Header contribution shared with the Timeline controller. */
-		function MessageEditHeader({ useMessageEdit, acquire, load, openVersion, reroll, edit, retry }) {
+		function MessageEditHeader({ useMessageEdit, load, openVersion, reroll, save, delete: deleteDraft, commit, retry }) {
 			const state = useMessageEdit((value) => value);
 			(0, react.useEffect)(() => {
-				const release = acquire();
 				load();
-				return release;
-			}, [acquire, load]);
+			}, [load]);
 			const timeline = state.timeline;
 			const versions = state.timeline?.versions ?? [];
 			const undoSessionId = timeline?.undoStack[0];
@@ -748,7 +806,10 @@ window.__ModuleLoader__.load({
 			const busy = state.pending !== null || state.status !== "ready";
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(InlineMessageEdit, {
 				messages: state.status === "ready" && state.pending === null ? timeline?.messages ?? [] : [],
-				edit,
+				drafts: state.drafts,
+				save,
+				delete: deleteDraft,
+				commit,
 				retry
 			}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: MessageEditHeader_module_css_default["root"],
@@ -792,8 +853,8 @@ window.__ModuleLoader__.load({
 			})] });
 		}
 		//#endregion
-		//#region \0dsh-css:/home/moeblack/repos/dsh-message-edit/src/client/MessageEditTimelineView.module.css.mjs
-		const css = ".i5o6sG_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.i5o6sG_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.i5o6sG_title,.i5o6sG_intro,.i5o6sG_subtitle,.i5o6sG_notice,.i5o6sG_error,.i5o6sG_empty,.i5o6sG_turnTitle,.i5o6sG_turnPreview,.i5o6sG_messageText{margin:0}.i5o6sG_title{font-size:22px;font-weight:600;line-height:30px}.i5o6sG_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.i5o6sG_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.i5o6sG_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.i5o6sG_select,.i5o6sG_textarea,.i5o6sG_primaryButton,.i5o6sG_secondaryButton,.i5o6sG_textButton,.i5o6sG_versionButton{box-sizing:border-box;font:inherit}.i5o6sG_select,.i5o6sG_textarea{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.i5o6sG_select{height:34px;padding:0 30px 0 9px;font-size:12px}.i5o6sG_primaryButton,.i5o6sG_secondaryButton,.i5o6sG_textButton,.i5o6sG_versionButton{cursor:pointer;border:0}.i5o6sG_primaryButton,.i5o6sG_secondaryButton{border-radius:17px;justify-content:center;align-items:center;min-height:34px;padding:0 13px;font-size:12px;line-height:18px;display:inline-flex}.i5o6sG_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.i5o6sG_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.i5o6sG_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.i5o6sG_secondaryButton:hover:not(:disabled),.i5o6sG_textButton:hover:not(:disabled),.i5o6sG_versionButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.i5o6sG_primaryButton:disabled,.i5o6sG_secondaryButton:disabled,.i5o6sG_textButton:disabled,.i5o6sG_versionButton:disabled,.i5o6sG_select:disabled{cursor:default;opacity:.45}.i5o6sG_primaryButton:focus-visible,.i5o6sG_secondaryButton:focus-visible,.i5o6sG_textButton:focus-visible,.i5o6sG_versionButton:focus-visible,.i5o6sG_select:focus-visible,.i5o6sG_textarea:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.i5o6sG_notice,.i5o6sG_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.i5o6sG_notice{color:var(--dsw-alias-state-warn-label)}.i5o6sG_error{color:var(--dsw-alias-state-error-primary)}.i5o6sG_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.i5o6sG_status .i5o6sG_error{margin:0}.i5o6sG_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.i5o6sG_versionsPanel,.i5o6sG_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.i5o6sG_versionsPanel{position:sticky;top:0}.i5o6sG_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.i5o6sG_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.i5o6sG_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.i5o6sG_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.i5o6sG_effectButtons .i5o6sG_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.i5o6sG_subtitle{font-size:16px;font-weight:500;line-height:24px}.i5o6sG_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.i5o6sG_versionList,.i5o6sG_turnList{margin:0;padding:0;list-style:none}.i5o6sG_versionList{flex-direction:column;gap:4px;display:flex}.i5o6sG_versionItem{--message-edit-depth:0;padding-left:calc(var(--message-edit-depth) * 14px);position:relative}.i5o6sG_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.i5o6sG_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.i5o6sG_versionButton:not([data-current]) .i5o6sG_pathBadge{opacity:.8}.i5o6sG_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.i5o6sG_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.i5o6sG_versionButton[data-current] .i5o6sG_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.i5o6sG_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.i5o6sG_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.i5o6sG_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.i5o6sG_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.i5o6sG_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.i5o6sG_currentBadge,.i5o6sG_pathBadge,.i5o6sG_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.i5o6sG_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.i5o6sG_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.i5o6sG_turnList{flex-direction:column;gap:14px;display:flex}.i5o6sG_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.i5o6sG_turnHeader,.i5o6sG_messageHeader,.i5o6sG_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.i5o6sG_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.i5o6sG_turnTitle{font-size:14px;font-weight:500;line-height:22px}.i5o6sG_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.i5o6sG_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.i5o6sG_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.i5o6sG_messageHeader{justify-content:flex-start}.i5o6sG_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.i5o6sG_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.i5o6sG_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.i5o6sG_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.i5o6sG_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.i5o6sG_editor{margin-top:8px}.i5o6sG_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.i5o6sG_editorActions{margin-top:8px}.i5o6sG_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.i5o6sG_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}@media (width<=1000px){.i5o6sG_columns{grid-template-columns:1fr}.i5o6sG_versionsPanel{position:static}}@media (width<=680px){.i5o6sG_root{padding:16px}.i5o6sG_pageHeader,.i5o6sG_headerActions,.i5o6sG_turnHeader,.i5o6sG_editorActions{flex-direction:column;align-items:stretch}.i5o6sG_headerActions,.i5o6sG_primaryButton,.i5o6sG_secondaryButton{width:100%}}";
+		//#region \0dsh-css:D:\AI\code\dsh-message-edit-main\src\client\MessageEditTimelineView.module.css.mjs
+		const css = "._7y6Yva_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}._7y6Yva_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}._7y6Yva_title,._7y6Yva_intro,._7y6Yva_subtitle,._7y6Yva_notice,._7y6Yva_error,._7y6Yva_empty,._7y6Yva_turnTitle,._7y6Yva_turnPreview,._7y6Yva_messageText{margin:0}._7y6Yva_title{font-size:22px;font-weight:600;line-height:30px}._7y6Yva_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}._7y6Yva_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}._7y6Yva_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}._7y6Yva_select,._7y6Yva_textarea,._7y6Yva_primaryButton,._7y6Yva_secondaryButton,._7y6Yva_textButton,._7y6Yva_dangerButton,._7y6Yva_versionButton{box-sizing:border-box;font:inherit}._7y6Yva_select,._7y6Yva_textarea{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}._7y6Yva_select{height:34px;padding:0 30px 0 9px;font-size:12px}._7y6Yva_primaryButton,._7y6Yva_secondaryButton,._7y6Yva_textButton,._7y6Yva_dangerButton,._7y6Yva_versionButton{cursor:pointer;border:0}._7y6Yva_primaryButton,._7y6Yva_secondaryButton,._7y6Yva_dangerButton{border-radius:17px;justify-content:center;align-items:center;min-height:34px;padding:0 13px;font-size:12px;line-height:18px;display:inline-flex}._7y6Yva_dangerButton{color:#fff;background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 68%, var(--dsw-alias-label-tertiary));border:1px solid #0000}._7y6Yva_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}._7y6Yva_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}._7y6Yva_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}._7y6Yva_secondaryButton:hover:not(:disabled),._7y6Yva_textButton:hover:not(:disabled),._7y6Yva_versionButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}._7y6Yva_dangerButton:hover:not(:disabled){opacity:.86}._7y6Yva_primaryButton:disabled,._7y6Yva_secondaryButton:disabled,._7y6Yva_textButton:disabled,._7y6Yva_dangerButton:disabled,._7y6Yva_versionButton:disabled,._7y6Yva_select:disabled{cursor:default;opacity:.45}._7y6Yva_primaryButton:focus-visible,._7y6Yva_secondaryButton:focus-visible,._7y6Yva_textButton:focus-visible,._7y6Yva_dangerButton:focus-visible,._7y6Yva_versionButton:focus-visible,._7y6Yva_select:focus-visible,._7y6Yva_textarea:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}._7y6Yva_notice,._7y6Yva_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}._7y6Yva_notice{color:var(--dsw-alias-state-warn-label)}._7y6Yva_error{color:var(--dsw-alias-state-error-primary)}._7y6Yva_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}._7y6Yva_status ._7y6Yva_error{margin:0}._7y6Yva_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}._7y6Yva_versionsPanel,._7y6Yva_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}._7y6Yva_versionsPanel{position:sticky;top:0}._7y6Yva_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}._7y6Yva_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}._7y6Yva_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}._7y6Yva_effectButtons{flex-wrap:wrap;gap:6px;display:flex}._7y6Yva_effectButtons ._7y6Yva_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}._7y6Yva_subtitle{font-size:16px;font-weight:500;line-height:24px}._7y6Yva_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}._7y6Yva_versionList,._7y6Yva_turnList{margin:0;padding:0;list-style:none}._7y6Yva_versionList{flex-direction:column;gap:4px;display:flex}._7y6Yva_versionItem{--message-edit-depth:0;padding-left:calc(var(--message-edit-depth) * 14px);position:relative}._7y6Yva_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}._7y6Yva_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}._7y6Yva_versionButton:not([data-current]) ._7y6Yva_pathBadge{opacity:.8}._7y6Yva_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}._7y6Yva_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}._7y6Yva_versionButton[data-current] ._7y6Yva_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}._7y6Yva_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}._7y6Yva_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}._7y6Yva_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}._7y6Yva_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}._7y6Yva_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}._7y6Yva_currentBadge,._7y6Yva_pathBadge,._7y6Yva_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}._7y6Yva_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}._7y6Yva_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}._7y6Yva_turnList{flex-direction:column;gap:14px;display:flex}._7y6Yva_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}._7y6Yva_turnHeader,._7y6Yva_messageHeader,._7y6Yva_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}._7y6Yva_turnActions,._7y6Yva_editorButtons{flex-wrap:wrap;justify-content:flex-end;align-items:center;gap:7px;display:flex}._7y6Yva_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}._7y6Yva_turnTitle{font-size:14px;font-weight:500;line-height:22px}._7y6Yva_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}._7y6Yva_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}._7y6Yva_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}._7y6Yva_messageCard[data-draft]{box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l3)}._7y6Yva_messageCard[data-deleted]{opacity:.72}._7y6Yva_messageHeader{justify-content:flex-start}._7y6Yva_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}._7y6Yva_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}._7y6Yva_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}._7y6Yva_draftBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1);border-radius:9px;padding:1px 6px;font-size:10px;line-height:17px}._7y6Yva_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}._7y6Yva_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}._7y6Yva_editor{margin-top:8px}._7y6Yva_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}._7y6Yva_editorActions{margin-top:8px}._7y6Yva_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}._7y6Yva_deletedNotice{color:var(--dsw-alias-state-error-primary);margin:8px 0 0;font-size:11px;line-height:18px}._7y6Yva_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}@media (width<=1000px){._7y6Yva_columns{grid-template-columns:1fr}._7y6Yva_versionsPanel{position:static}}@media (width<=680px){._7y6Yva_root{padding:16px}._7y6Yva_pageHeader,._7y6Yva_headerActions,._7y6Yva_turnHeader,._7y6Yva_editorActions,._7y6Yva_turnActions,._7y6Yva_editorButtons{flex-direction:column;align-items:stretch}._7y6Yva_headerActions,._7y6Yva_primaryButton,._7y6Yva_secondaryButton,._7y6Yva_dangerButton{width:100%}}";
 		const tagId = "dsh-message-edit/MessageEditTimelineView.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
 			const tag = document.createElement("style");
@@ -803,55 +864,60 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditTimelineView_module_css_default = {
-			"status": "i5o6sG_status",
-			"turnPreview": "i5o6sG_turnPreview",
-			"title": "i5o6sG_title",
-			"root": "i5o6sG_root",
-			"turnTitle": "i5o6sG_turnTitle",
-			"versionMeta": "i5o6sG_versionMeta",
-			"versionItem": "i5o6sG_versionItem",
-			"versionTitle": "i5o6sG_versionTitle",
-			"messageTime": "i5o6sG_messageTime",
-			"select": "i5o6sG_select",
-			"turnList": "i5o6sG_turnList",
-			"cascadeField": "i5o6sG_cascadeField",
-			"textarea": "i5o6sG_textarea",
-			"error": "i5o6sG_error",
-			"pageHeader": "i5o6sG_pageHeader",
-			"turnsPanel": "i5o6sG_turnsPanel",
-			"versionLine": "i5o6sG_versionLine",
-			"turnHeader": "i5o6sG_turnHeader",
-			"messageList": "i5o6sG_messageList",
-			"messageCard": "i5o6sG_messageCard",
-			"secondaryButton": "i5o6sG_secondaryButton",
-			"columns": "i5o6sG_columns",
-			"editorActions": "i5o6sG_editorActions",
-			"notice": "i5o6sG_notice",
-			"textButton": "i5o6sG_textButton",
-			"empty": "i5o6sG_empty",
-			"intro": "i5o6sG_intro",
-			"effectButtons": "i5o6sG_effectButtons",
-			"effectDepth": "i5o6sG_effectDepth",
-			"pathBadge": "i5o6sG_pathBadge",
-			"count": "i5o6sG_count",
-			"versionDiff": "i5o6sG_versionDiff",
-			"headerActions": "i5o6sG_headerActions",
-			"currentBadge": "i5o6sG_currentBadge",
-			"subtitle": "i5o6sG_subtitle",
-			"versionDot": "i5o6sG_versionDot",
-			"primaryButton": "i5o6sG_primaryButton",
-			"versionsPanel": "i5o6sG_versionsPanel",
-			"versionMain": "i5o6sG_versionMain",
-			"turnSection": "i5o6sG_turnSection",
-			"messageHeader": "i5o6sG_messageHeader",
-			"kindBadge": "i5o6sG_kindBadge",
-			"editor": "i5o6sG_editor",
-			"versionButton": "i5o6sG_versionButton",
-			"sectionHeading": "i5o6sG_sectionHeading",
-			"editorHint": "i5o6sG_editorHint",
-			"versionList": "i5o6sG_versionList",
-			"effectControls": "i5o6sG_effectControls",
-			"messageText": "i5o6sG_messageText"
+			"versionsPanel": "_7y6Yva_versionsPanel",
+			"primaryButton": "_7y6Yva_primaryButton",
+			"effectButtons": "_7y6Yva_effectButtons",
+			"versionDiff": "_7y6Yva_versionDiff",
+			"versionLine": "_7y6Yva_versionLine",
+			"versionTitle": "_7y6Yva_versionTitle",
+			"turnActions": "_7y6Yva_turnActions",
+			"status": "_7y6Yva_status",
+			"turnList": "_7y6Yva_turnList",
+			"textarea": "_7y6Yva_textarea",
+			"secondaryButton": "_7y6Yva_secondaryButton",
+			"editorButtons": "_7y6Yva_editorButtons",
+			"effectControls": "_7y6Yva_effectControls",
+			"intro": "_7y6Yva_intro",
+			"turnsPanel": "_7y6Yva_turnsPanel",
+			"count": "_7y6Yva_count",
+			"messageText": "_7y6Yva_messageText",
+			"turnHeader": "_7y6Yva_turnHeader",
+			"subtitle": "_7y6Yva_subtitle",
+			"turnTitle": "_7y6Yva_turnTitle",
+			"messageHeader": "_7y6Yva_messageHeader",
+			"effectDepth": "_7y6Yva_effectDepth",
+			"versionMeta": "_7y6Yva_versionMeta",
+			"versionList": "_7y6Yva_versionList",
+			"editorHint": "_7y6Yva_editorHint",
+			"textButton": "_7y6Yva_textButton",
+			"messageList": "_7y6Yva_messageList",
+			"messageTime": "_7y6Yva_messageTime",
+			"editor": "_7y6Yva_editor",
+			"root": "_7y6Yva_root",
+			"notice": "_7y6Yva_notice",
+			"turnPreview": "_7y6Yva_turnPreview",
+			"cascadeField": "_7y6Yva_cascadeField",
+			"messageCard": "_7y6Yva_messageCard",
+			"turnSection": "_7y6Yva_turnSection",
+			"currentBadge": "_7y6Yva_currentBadge",
+			"draftBadge": "_7y6Yva_draftBadge",
+			"deletedNotice": "_7y6Yva_deletedNotice",
+			"columns": "_7y6Yva_columns",
+			"pageHeader": "_7y6Yva_pageHeader",
+			"dangerButton": "_7y6Yva_dangerButton",
+			"versionMain": "_7y6Yva_versionMain",
+			"pathBadge": "_7y6Yva_pathBadge",
+			"versionDot": "_7y6Yva_versionDot",
+			"kindBadge": "_7y6Yva_kindBadge",
+			"sectionHeading": "_7y6Yva_sectionHeading",
+			"title": "_7y6Yva_title",
+			"error": "_7y6Yva_error",
+			"empty": "_7y6Yva_empty",
+			"headerActions": "_7y6Yva_headerActions",
+			"select": "_7y6Yva_select",
+			"editorActions": "_7y6Yva_editorActions",
+			"versionButton": "_7y6Yva_versionButton",
+			"versionItem": "_7y6Yva_versionItem"
 		};
 		//#endregion
 		//#region src/client/MessageEditTimelineView.tsx
@@ -880,6 +946,16 @@ window.__ModuleLoader__.load({
 				retry,
 				messages: messages.filter((message) => message.turn === retry.turn)
 			}));
+		}
+		function draftedText(message, textByKey) {
+			return textByKey[message.key] ?? message.text;
+		}
+		function isDraftDeleted(message, deletedEventSeqs) {
+			return deletedEventSeqs.includes(message.eventSeq);
+		}
+		function turnDraftCount(messages, textByKey, deletedEventSeqs) {
+			const deleted = new Set(deletedEventSeqs);
+			return new Set(messages.filter((message) => deleted.has(message.eventSeq)).map((message) => message.eventSeq)).size + messages.filter((message) => !deleted.has(message.eventSeq) && draftedText(message, textByKey) !== message.text).length;
 		}
 		function VersionRow({ version, disabled, onOpen }) {
 			const depthStyle = { "--message-edit-depth": String(version.depth) };
@@ -936,10 +1012,15 @@ window.__ModuleLoader__.load({
 				})
 			});
 		}
-		function MessageCard({ message, editing, disabled, cascade, onBeginEdit, onCancelEdit, onTextChange, onApplyEdit }) {
+		function MessageCard({ message, editing, textByKey, deletedEventSeqs, disabled, cascade, onBeginEdit, onCancelEdit, onTextChange, onSave, onCommit, onDelete, onRestore }) {
 			const active = editing?.message.key === message.key;
+			const deleted = isDraftDeleted(message, deletedEventSeqs);
+			const text = draftedText(message, textByKey);
+			const hasDraft = deleted || text !== message.text;
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("article", {
 				className: MessageEditTimelineView_module_css_default["messageCard"],
+				"data-draft": hasDraft || void 0,
+				"data-deleted": deleted || void 0,
 				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 					className: MessageEditTimelineView_module_css_default["messageHeader"],
 					children: [
@@ -952,7 +1033,19 @@ window.__ModuleLoader__.load({
 							className: MessageEditTimelineView_module_css_default["messageTime"],
 							children: timeLabel(message.time)
 						}),
-						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+						hasDraft ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: MessageEditTimelineView_module_css_default["draftBadge"],
+							children: "草稿"
+						}) : null,
+						deleted ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: MessageEditTimelineView_module_css_default["textButton"],
+							disabled,
+							onClick: () => {
+								onRestore(message);
+							},
+							children: "撤销删除"
+						}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(react_jsx_runtime.Fragment, { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 							type: "button",
 							className: MessageEditTimelineView_module_css_default["textButton"],
 							disabled,
@@ -960,9 +1053,12 @@ window.__ModuleLoader__.load({
 								active ? onCancelEdit() : onBeginEdit(message);
 							},
 							children: active ? "取消" : "编辑"
-						})
+						}) })
 					]
-				}), active && editing !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				}), deleted ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+					className: MessageEditTimelineView_module_css_default["deletedNotice"],
+					children: "已保存到草稿；保存并重新生成后，这条消息将不存在于新分支中。"
+				}) : active && editing !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 					className: MessageEditTimelineView_module_css_default["editor"],
 					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
 						className: MessageEditTimelineView_module_css_default["textarea"],
@@ -976,33 +1072,54 @@ window.__ModuleLoader__.load({
 						className: MessageEditTimelineView_module_css_default["editorActions"],
 						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 							className: MessageEditTimelineView_module_css_default["editorHint"],
-							children: "将从该回合之前分支，原版本保持不变。"
-						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-							type: "button",
-							className: MessageEditTimelineView_module_css_default["primaryButton"],
-							disabled,
-							onClick: () => {
-								onApplyEdit(message, editing.text, cascade);
-							},
-							children: "应用并重生成"
+							children: "保存只写入草稿；保存并重新生成才会创建分支。"
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: MessageEditTimelineView_module_css_default["editorButtons"],
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: MessageEditTimelineView_module_css_default["secondaryButton"],
+									disabled,
+									onClick: () => {
+										onSave(message, editing.text);
+									},
+									children: "保存"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: MessageEditTimelineView_module_css_default["dangerButton"],
+									disabled,
+									onClick: () => {
+										onDelete(message);
+									},
+									children: "删除"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: MessageEditTimelineView_module_css_default["primaryButton"],
+									disabled,
+									onClick: () => {
+										onCommit(message, editing.text, cascade);
+									},
+									children: "保存并重新生成"
+								})
+							]
 						})]
 					})]
 				}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("pre", {
 					className: MessageEditTimelineView_module_css_default["messageText"],
-					children: message.text || "（空内容）"
+					children: text || "（空内容）"
 				})]
 			});
 		}
 		/** Conversation-view entry point. */
-		function MessageEditTimelineView({ useMessageEdit, acquire, load, edit, retry, reroll, openVersion }) {
+		function MessageEditTimelineView({ useMessageEdit, load, save, delete: deleteDraft, restore, commit, commitTurn, retry, reroll, openVersion }) {
 			const state = useMessageEdit((value) => value);
 			const [cascade, setCascade] = (0, react.useState)("truncate");
 			const [editing, setEditing] = (0, react.useState)(null);
 			(0, react.useEffect)(() => {
-				const release = acquire();
 				load();
-				return release;
-			}, [acquire, load]);
+			}, [load]);
 			const timeline = state.timeline;
 			const sections = (0, react.useMemo)(() => timeline === null ? [] : turnSections(timeline.retryableTurns, timeline.messages), [timeline]);
 			const busy = state.pending !== null || state.status !== "ready";
@@ -1029,9 +1146,18 @@ window.__ModuleLoader__.load({
 				})]
 			});
 			if (timeline === null) return null;
-			const applyEdit = (message, text, policy) => {
+			const saveEdit = (message, text) => {
+				save(message, text);
 				setEditing(null);
-				edit(message, text, policy);
+			};
+			const commitEdit = async (message, text, policy) => {
+				const applied = await commit(message, text, policy);
+				if (applied) setEditing(null);
+				return applied;
+			};
+			const deleteEdit = (message) => {
+				deleteDraft(message);
+				setEditing((current) => current?.message.eventSeq === message.eventSeq ? null : current);
 			};
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: MessageEditTimelineView_module_css_default["root"],
@@ -1167,26 +1293,39 @@ window.__ModuleLoader__.load({
 										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
 											className: MessageEditTimelineView_module_css_default["turnPreview"],
 											children: section.retry.preview || "（空用户输入）"
-										})] }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											className: MessageEditTimelineView_module_css_default["secondaryButton"],
-											disabled: busy,
-											onClick: () => {
-												retry(section.retry.turn, cascade);
-											},
-											children: state.pending === "retry" ? "正在重试…" : "重试此回合"
+										})] }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+											className: MessageEditTimelineView_module_css_default["turnActions"],
+											children: [section.retry.retryable ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+												type: "button",
+												className: MessageEditTimelineView_module_css_default["secondaryButton"],
+												disabled: busy,
+												onClick: () => {
+													retry(section.retry.turn, cascade);
+												},
+												children: state.pending === "retry" ? "正在重试…" : "重试此回合"
+											}) : null, /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+												type: "button",
+												className: MessageEditTimelineView_module_css_default["primaryButton"],
+												disabled: busy || turnDraftCount(section.messages, state.drafts.textByKey, state.drafts.deletedEventSeqs) === 0,
+												onClick: () => {
+													commitTurn(section.retry.turn, cascade);
+												},
+												children: state.pending === "edit" ? "正在保存并重新生成…" : `保存并重新生成 (${String(turnDraftCount(section.messages, state.drafts.textByKey, state.drafts.deletedEventSeqs))})`
+											})]
 										})]
 									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 										className: MessageEditTimelineView_module_css_default["messageList"],
 										children: section.messages.map((message) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(MessageCard, {
 											message,
 											editing,
+											textByKey: state.drafts.textByKey,
+											deletedEventSeqs: state.drafts.deletedEventSeqs,
 											disabled: busy,
 											cascade,
 											onBeginEdit: (value) => {
 												setEditing({
 													message: value,
-													text: value.text
+													text: draftedText(value, state.drafts.textByKey)
 												});
 											},
 											onCancelEdit: () => {
@@ -1198,7 +1337,10 @@ window.__ModuleLoader__.load({
 													text
 												});
 											},
-											onApplyEdit: applyEdit
+											onSave: saveEdit,
+											onCommit: commitEdit,
+											onDelete: deleteEdit,
+											onRestore: restore
 										}, message.key))
 									})]
 								}, section.retry.turn))

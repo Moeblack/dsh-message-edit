@@ -15,6 +15,8 @@ import {
   type CascadePolicy,
   type EditableBlockKind,
   type EditableMessageBlock,
+  type EditOperation,
+  type MessageEditChange,
   type MessageEditOperation,
   type MessageEditOperationResult,
   type MessageEditTimeline,
@@ -29,17 +31,24 @@ export interface MessageEditState {
   error: string | null
   pending: VersionOperation | null
   timeline: MessageEditTimeline | null
+  drafts: MessageEditDrafts
 }
 
-/** Merge a burst of turn completions into one refresh. */
-const REFRESH_DELAY_MS = 300
+/** Session-local edits that remain client-side until the user creates a fork. */
+export interface MessageEditDrafts {
+  textByKey: Record<string, string>
+  deletedEventSeqs: number[]
+}
 
 /** Plain business face; the renderer binds the reserved source compartment. */
 export interface MessageEditFace {
   hooks: { messageEdit: ObservableSnapshot<MessageEditState> }
-  acquire(): () => void
   load(): void
-  edit(message: EditableMessageBlock, text: string, cascade: CascadePolicy): Promise<boolean>
+  save(message: EditableMessageBlock, text: string): void
+  delete(message: EditableMessageBlock): void
+  restore(message: EditableMessageBlock): void
+  commit(message: EditableMessageBlock, text: string, cascade: CascadePolicy): Promise<boolean>
+  commitTurn(turn: number, cascade: CascadePolicy): Promise<boolean>
   retry(turn: number, cascade: CascadePolicy): Promise<boolean>
   reroll(): Promise<boolean>
   openVersion(sessionId: string): Promise<void>
@@ -95,9 +104,12 @@ function decodeRetryable(value: unknown, index: number): RetryableTurn {
   const row = objectValue(value, `retryableTurns[${String(index)}]`)
   return {
     turn: numberValue(row['turn'], '回合 turn'),
-    userEventSeq: numberValue(row['userEventSeq'], '回合 userEventSeq'),
+    ...row['userEventSeq'] === undefined
+      ? {}
+      : { userEventSeq: numberValue(row['userEventSeq'], '回合 userEventSeq') },
     preview: stringValue(row['preview'], '回合 preview'),
     time: numberValue(row['time'], '回合 time'),
+    retryable: booleanValue(row['retryable'], '回合 retryable'),
   }
 }
 
@@ -168,6 +180,21 @@ function decodeOperationResult(value: unknown): MessageEditOperationResult {
   }
 }
 
+function emptyDrafts(): MessageEditDrafts {
+  return { textByKey: {}, deletedEventSeqs: [] }
+}
+
+function pruneDrafts(drafts: MessageEditDrafts, timeline: MessageEditTimeline): MessageEditDrafts {
+  const messagesByKey = new Map(timeline.messages.map(message => [message.key, message]))
+  const textByKey = Object.fromEntries(Object.entries(drafts.textByKey)
+    .filter(([key, text]) => messagesByKey.get(key)?.text !== undefined && messagesByKey.get(key)?.text !== text))
+  const messageEventSeqs = new Set(timeline.messages.map(message => message.eventSeq))
+  return {
+    textByKey,
+    deletedEventSeqs: drafts.deletedEventSeqs.filter(eventSeq => messageEventSeqs.has(eventSeq)),
+  }
+}
+
 async function responseValue(response: Response): Promise<unknown> {
   const value = await response.json() as unknown
   if (response.ok) return value
@@ -216,49 +243,33 @@ export class MessageEditController {
     error: null,
     pending: null,
     timeline: null,
+    drafts: emptyDrafts(),
   })
 
   readonly face: MessageEditFace
   private generation = 0
-  private readonly ctx: ClientContext
   private readonly sessions: ISessions
   private sessionSource: SessionFace | undefined
   private sessionSourceDispose: (() => void) | undefined
   private sessionRevision: string | undefined
   private listRevision = ''
   private refreshScheduled = false
-  private refreshTimer: ReturnType<typeof setTimeout> | undefined
   private observing = false
   private readonly navigationWaits = new Set<() => void>()
-  private disposeObservation: (() => Promise<void>) | undefined = undefined
-  private inflight: Promise<void> | null = null
-  private rerunAfter = false
-  private abort: AbortController | null = null
-  private disposed = false
-  private users = 0
 
   constructor(
     ctx: ClientContext,
     private readonly sessionId: SessionId,
   ) {
-    this.ctx = ctx
     this.sessions = ctx.get('sessions') as unknown as ISessions
     this.face = {
       hooks: { messageEdit: this.store },
-      acquire: () => {
-        this.users += 1
-        if (this.users === 1 && this.disposed) this.revive()
-        return () => this.release()
-      },
       load: () => { void this.load() },
-      edit: (message, text, cascade) => this.mutate({
-        action: 'edit',
-        sessionId: this.sessionId,
-        eventSeq: message.eventSeq,
-        blockIndex: message.blockIndex,
-        text,
-        cascade,
-      }),
+      save: (message, text) => { this.saveDraft(message, text) },
+      delete: message => { this.deleteDraft(message) },
+      restore: message => { this.restoreDraft(message) },
+      commit: (message, text, cascade) => this.commitDraft(message, text, cascade),
+      commitTurn: (turn, cascade) => this.commitTurn(turn, cascade),
       retry: (turn, cascade) => this.mutate({
         action: 'retry',
         sessionId: this.sessionId,
@@ -268,43 +279,7 @@ export class MessageEditController {
       reroll: () => this.mutate({ action: 'reroll', sessionId: this.sessionId }),
       openVersion: sessionId => this.openWhenListed(sessionId as SessionId),
     }
-    this.observe()
-  }
-
-  private observe(): void {
-    this.disposeObservation = this.ctx.effect(
-      () => this.observeDependencies(),
-      `message-edit: observe ${this.sessionId}`,
-    )
-  }
-
-  private release(): void {
-    this.users -= 1
-    if (this.users <= 0) this.dispose()
-  }
-
-  /** Tear subscriptions down once no mounted entry uses this controller. */
-  private dispose(): void {
-    if (this.disposed) return
-    this.disposed = true
-    this.generation += 1
-    if (this.refreshTimer !== undefined) {
-      clearTimeout(this.refreshTimer)
-      this.refreshTimer = undefined
-      this.refreshScheduled = false
-    }
-    this.abort?.abort()
-    this.abort = null
-    void this.disposeObservation?.()
-    this.disposeObservation = undefined
-  }
-
-  /** Re-observe after a transient zero; the retained store keeps old data
-   * until the immediate refetch below commits. */
-  private revive(): void {
-    this.disposed = false
-    this.observe()
-    this.refresh()
+    ctx.effect(() => this.observeDependencies(), `message-edit: observe ${sessionId}`)
   }
 
   /** Bind to replaceable value sources instead of retaining a Session object. */
@@ -350,57 +325,24 @@ export class MessageEditController {
   private invalidate(): void {
     if (!this.observing || this.store.getSnapshot().status === 'idle' || this.refreshScheduled) return
     this.refreshScheduled = true
-    this.refreshTimer = setTimeout(() => {
-      this.refreshTimer = undefined
+    queueMicrotask(() => {
       this.refreshScheduled = false
-      if (this.observing && this.store.getSnapshot().status !== 'idle') this.refresh()
-    }, REFRESH_DELAY_MS)
+      if (this.observing && this.store.getSnapshot().status !== 'idle') void this.load()
+    })
   }
 
-  /** Invalidation-driven refetch: one in-flight request absorbs the demand
-   * and commits a single rerun once it settles. */
-  private refresh(): void {
-    if (this.disposed) return
-    if (this.inflight !== null) {
-      this.rerunAfter = true
-      return
-    }
-    void this.load()
-  }
-
-  /** Refetch the full value-level projection; concurrent callers share one
-   * request, and an invalidation during flight schedules exactly one rerun. */
+  /** Refetch the full value-level projection; only the newest request commits. */
   async load(): Promise<void> {
-    if (this.disposed) return
-    if (this.inflight !== null) return this.inflight
     const generation = ++this.generation
-    this.abort?.abort()
-    const abort = new AbortController()
-    this.abort = abort
     this.store.update((state) => {
       state.status = 'loading'
       state.error = null
     })
-    const run = this.performLoad(generation, abort)
-    this.inflight = run
-    try {
-      await run
-    } finally {
-      if (this.inflight === run) this.inflight = null
-      if (this.rerunAfter && !this.disposed) {
-        this.rerunAfter = false
-        void this.load()
-      }
-    }
-  }
-
-  private async performLoad(generation: number, abort: AbortController): Promise<void> {
     try {
       const response = await fetch(`${MESSAGE_EDIT_PATH}?sessionId=${encodeURIComponent(this.sessionId)}`, {
         method: 'GET',
         headers: { accept: 'application/json' },
         cache: 'no-store',
-        signal: abort.signal,
       })
       const timeline = decodeTimeline(await responseValue(response))
       if (generation !== this.generation) return
@@ -408,6 +350,7 @@ export class MessageEditController {
         state.status = 'ready'
         state.error = null
         state.timeline = timeline
+        state.drafts = pruneDrafts(state.drafts, timeline)
       })
     } catch (error) {
       if (generation !== this.generation) return
@@ -420,8 +363,116 @@ export class MessageEditController {
 
   /** Refresh only controllers whose projection has already been requested. */
   refreshIfLoaded(): void {
-    if (this.disposed || this.store.getSnapshot().status === 'idle') return
-    this.refresh()
+    if (this.store.getSnapshot().status !== 'idle') void this.load()
+  }
+
+  private saveDraft(message: EditableMessageBlock, text: string): void {
+    this.store.update((state) => {
+      const timeline = state.timeline
+      if (timeline === null || !timeline.messages.some(candidate => candidate.key === message.key)) {
+        state.error = '要保存的消息已不在当前会话中。'
+        return
+      }
+      const textByKey = { ...state.drafts.textByKey }
+      if (text === message.text) delete textByKey[message.key]
+      else textByKey[message.key] = text
+      state.drafts = { ...state.drafts, textByKey }
+      state.error = null
+    })
+  }
+
+  private deleteDraft(message: EditableMessageBlock): void {
+    this.store.update((state) => {
+      const textByKey = { ...state.drafts.textByKey }
+      for (const key of Object.keys(textByKey)) {
+        if (key.startsWith(`${String(message.eventSeq)}:`)) delete textByKey[key]
+      }
+      state.drafts = {
+        textByKey,
+        deletedEventSeqs: [...new Set([...state.drafts.deletedEventSeqs, message.eventSeq])],
+      }
+      state.error = null
+    })
+  }
+
+  private restoreDraft(message: EditableMessageBlock): void {
+    this.store.update((state) => {
+      state.drafts = {
+        ...state.drafts,
+        deletedEventSeqs: state.drafts.deletedEventSeqs.filter(eventSeq => eventSeq !== message.eventSeq),
+      }
+      state.error = null
+    })
+  }
+
+  private draftChangesForTurn(turn: number): MessageEditChange[] | undefined {
+    const state = this.store.getSnapshot()
+    const timeline = state.timeline
+    if (timeline === null) return undefined
+    const deleted = new Set(state.drafts.deletedEventSeqs)
+    const deletedAdded = new Set<number>()
+    const changes: MessageEditChange[] = []
+    for (const message of timeline.messages) {
+      if (message.turn !== turn) continue
+      if (deleted.has(message.eventSeq)) {
+        if (!deletedAdded.has(message.eventSeq)) {
+          changes.push({ action: 'delete', eventSeq: message.eventSeq })
+          deletedAdded.add(message.eventSeq)
+        }
+        continue
+      }
+      const text = state.drafts.textByKey[message.key]
+      if (text !== undefined && text !== message.text) {
+        changes.push({
+          action: 'replace',
+          eventSeq: message.eventSeq,
+          blockIndex: message.blockIndex,
+          text,
+        })
+      }
+    }
+    return changes
+  }
+
+  private async commitDraft(
+    message: EditableMessageBlock,
+    text: string,
+    cascade: CascadePolicy,
+  ): Promise<boolean> {
+    this.saveDraft(message, text)
+    return this.commitTurn(message.turn, cascade)
+  }
+
+  private async commitTurn(turn: number, cascade: CascadePolicy): Promise<boolean> {
+    const changes = this.draftChangesForTurn(turn)
+    if (changes === undefined) return false
+    if (changes.length === 0) {
+      this.store.update((state) => { state.error = '此回合没有已保存的编辑草稿。' })
+      return false
+    }
+    const applied = await this.mutate({
+      action: 'edit',
+      sessionId: this.sessionId,
+      turn,
+      changes,
+      cascade,
+    } satisfies EditOperation)
+    if (applied) this.clearTurnDraft(turn)
+    return applied
+  }
+
+  private clearTurnDraft(turn: number): void {
+    this.store.update((state) => {
+      const messages = state.timeline?.messages.filter(message => message.turn === turn) ?? []
+      const keys = new Set(messages.map(message => message.key))
+      const eventSeqs = new Set(messages.map(message => message.eventSeq))
+      const textByKey = Object.fromEntries(Object.entries(state.drafts.textByKey)
+        .filter(([key]) => !keys.has(key)))
+      state.drafts = {
+        textByKey,
+        deletedEventSeqs: state.drafts.deletedEventSeqs.filter(eventSeq => !eventSeqs.has(eventSeq)),
+      }
+    })
   }
 
   private async mutate(operation: MessageEditOperation): Promise<boolean> {
@@ -441,12 +492,10 @@ export class MessageEditController {
         body: JSON.stringify(operation),
       })
       const result = decodeOperationResult(await responseValue(response))
-      if (this.disposed) return true
       this.store.update((state) => { state.pending = null })
       await this.openWhenListed(result.sessionId as SessionId)
       return true
     } catch (error) {
-      if (this.disposed) return false
       this.store.update((state) => {
         state.pending = null
         state.error = messageOf(error)

@@ -65,6 +65,7 @@
 .primaryButton,
 .secondaryButton,
 .textButton,
+.dangerButton,
 .versionButton {
   box-sizing: border-box;
   font: inherit;
@@ -87,13 +88,15 @@
 .primaryButton,
 .secondaryButton,
 .textButton,
+.dangerButton,
 .versionButton {
   border: 0;
   cursor: pointer;
 }
 
 .primaryButton,
-.secondaryButton {
+.secondaryButton,
+.dangerButton {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -102,6 +105,12 @@
   border-radius: 17px;
   font-size: 12px;
   line-height: 18px;
+}
+
+.dangerButton {
+  border: 1px solid transparent;
+  color: #fff;
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 68%, var(--dsw-alias-label-tertiary));
 }
 
 .primaryButton {
@@ -126,9 +135,14 @@
   background: var(--dsw-alias-interactive-bg-hover);
 }
 
+.dangerButton:hover:not(:disabled) {
+  opacity: 0.86;
+}
+
 .primaryButton:disabled,
 .secondaryButton:disabled,
 .textButton:disabled,
+.dangerButton:disabled,
 .versionButton:disabled,
 .select:disabled {
   cursor: default;
@@ -138,6 +152,7 @@
 .primaryButton:focus-visible,
 .secondaryButton:focus-visible,
 .textButton:focus-visible,
+.dangerButton:focus-visible,
 .versionButton:focus-visible,
 .select:focus-visible,
 .textarea:focus-visible {
@@ -402,6 +417,15 @@
   gap: 10px;
 }
 
+.turnActions,
+.editorButtons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
 .turnHeader {
   align-items: flex-start;
   padding-bottom: 11px;
@@ -439,6 +463,14 @@
   background: var(--dsw-alias-bg-module-platform);
 }
 
+.messageCard[data-draft] {
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l3);
+}
+
+.messageCard[data-deleted] {
+  opacity: 0.72;
+}
+
 .messageHeader {
   justify-content: flex-start;
 }
@@ -454,6 +486,15 @@
 
 .messageTime {
   color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  line-height: 17px;
+}
+
+.draftBadge {
+  padding: 1px 6px;
+  border-radius: 9px;
+  color: var(--dsw-alias-brand-primary);
+  background: var(--dsw-alias-bg-layer-1);
   font-size: 10px;
   line-height: 17px;
 }
@@ -503,6 +544,13 @@
   line-height: 16px;
 }
 
+.deletedNotice {
+  margin: 8px 0 0;
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 11px;
+  line-height: 18px;
+}
+
 .empty {
   padding: 18px;
   border-radius: 10px;
@@ -530,7 +578,9 @@
   .pageHeader,
   .headerActions,
   .turnHeader,
-  .editorActions {
+  .editorActions,
+  .turnActions,
+  .editorButtons {
     flex-direction: column;
     align-items: stretch;
   }
@@ -540,7 +590,8 @@
   }
 
   .primaryButton,
-  .secondaryButton {
+  .secondaryButton,
+  .dangerButton {
     width: 100%;
   }
 }

@@ -57,6 +57,29 @@ function turnSections(
   }))
 }
 
+function draftedText(message: EditableMessageBlock, textByKey: Record<string, string>): string {
+  return textByKey[message.key] ?? message.text
+}
+
+function isDraftDeleted(message: EditableMessageBlock, deletedEventSeqs: readonly number[]): boolean {
+  return deletedEventSeqs.includes(message.eventSeq)
+}
+
+function turnDraftCount(
+  messages: readonly EditableMessageBlock[],
+  textByKey: Record<string, string>,
+  deletedEventSeqs: readonly number[],
+): number {
+  const deleted = new Set(deletedEventSeqs)
+  const deletedCount = new Set(messages
+    .filter(message => deleted.has(message.eventSeq))
+    .map(message => message.eventSeq)).size
+  const replacementCount = messages.filter(message => (
+    !deleted.has(message.eventSeq) && draftedText(message, textByKey) !== message.text
+  )).length
+  return deletedCount + replacementCount
+}
+
 function VersionRow({ version, disabled, onOpen }: {
   version: VersionSummary
   disabled: boolean
@@ -107,38 +130,69 @@ function VersionRow({ version, disabled, onOpen }: {
 function MessageCard({
   message,
   editing,
+  textByKey,
+  deletedEventSeqs,
   disabled,
   cascade,
   onBeginEdit,
   onCancelEdit,
   onTextChange,
-  onApplyEdit,
+  onSave,
+  onCommit,
+  onDelete,
+  onRestore,
 }: {
   message: EditableMessageBlock
   editing: EditingState | null
+  textByKey: Record<string, string>
+  deletedEventSeqs: readonly number[]
   disabled: boolean
   cascade: CascadePolicy
   onBeginEdit: (message: EditableMessageBlock) => void
   onCancelEdit: () => void
   onTextChange: (text: string) => void
-  onApplyEdit: (message: EditableMessageBlock, text: string, cascade: CascadePolicy) => void
+  onSave: (message: EditableMessageBlock, text: string) => void
+  onCommit: (message: EditableMessageBlock, text: string, cascade: CascadePolicy) => Promise<boolean>
+  onDelete: (message: EditableMessageBlock) => void
+  onRestore: (message: EditableMessageBlock) => void
 }): ReactNode {
   const active = editing?.message.key === message.key
+  const deleted = isDraftDeleted(message, deletedEventSeqs)
+  const text = draftedText(message, textByKey)
+  const hasDraft = deleted || text !== message.text
   return (
-    <article className={styles['messageCard']}>
+    <article className={styles['messageCard']} data-draft={hasDraft || undefined} data-deleted={deleted || undefined}>
       <div className={styles['messageHeader']}>
         <span className={styles['kindBadge']} data-kind={message.kind}>{BLOCK_LABEL[message.kind]}</span>
         <span className={styles['messageTime']}>{timeLabel(message.time)}</span>
-        <button
-          type="button"
-          className={styles['textButton']}
-          disabled={disabled}
-          onClick={() => { active ? onCancelEdit() : onBeginEdit(message) }}
-        >
-          {active ? '取消' : '编辑'}
-        </button>
+        {hasDraft ? <span className={styles['draftBadge']}>草稿</span> : null}
+        {deleted
+          ? (
+            <button
+              type="button"
+              className={styles['textButton']}
+              disabled={disabled}
+              onClick={() => { onRestore(message) }}
+            >
+              撤销删除
+            </button>
+          )
+          : (
+            <>
+              <button
+                type="button"
+                className={styles['textButton']}
+                disabled={disabled}
+                onClick={() => { active ? onCancelEdit() : onBeginEdit(message) }}
+              >
+                {active ? '取消' : '编辑'}
+              </button>
+            </>
+          )}
       </div>
-      {active && editing !== null
+      {deleted
+        ? <p className={styles['deletedNotice']}>已保存到草稿；保存并重新生成后，这条消息将不存在于新分支中。</p>
+        : active && editing !== null
         ? (
           <div className={styles['editor']}>
             <textarea
@@ -149,19 +203,37 @@ function MessageCard({
               onChange={(event) => { onTextChange(event.currentTarget.value) }}
             />
             <div className={styles['editorActions']}>
-              <span className={styles['editorHint']}>将从该回合之前分支，原版本保持不变。</span>
-              <button
-                type="button"
-                className={styles['primaryButton']}
-                disabled={disabled}
-                onClick={() => { onApplyEdit(message, editing.text, cascade) }}
-              >
-                应用并重生成
-              </button>
+              <span className={styles['editorHint']}>保存只写入草稿；保存并重新生成才会创建分支。</span>
+              <div className={styles['editorButtons']}>
+                <button
+                  type="button"
+                  className={styles['secondaryButton']}
+                  disabled={disabled}
+                  onClick={() => { onSave(message, editing.text) }}
+                >
+                  保存
+                </button>
+                <button
+                  type="button"
+                  className={styles['dangerButton']}
+                  disabled={disabled}
+                  onClick={() => { onDelete(message) }}
+                >
+                  删除
+                </button>
+                <button
+                  type="button"
+                  className={styles['primaryButton']}
+                  disabled={disabled}
+                  onClick={() => { void onCommit(message, editing.text, cascade) }}
+                >
+                  保存并重新生成
+                </button>
+              </div>
             </div>
           </div>
         )
-        : <pre className={styles['messageText']}>{message.text || '（空内容）'}</pre>}
+        : <pre className={styles['messageText']}>{text || '（空内容）'}</pre>}
     </article>
   )
 }
@@ -169,9 +241,12 @@ function MessageCard({
 /** Conversation-view entry point. */
 export function MessageEditTimelineView({
   useMessageEdit,
-  acquire,
   load,
-  edit,
+  save,
+  delete: deleteDraft,
+  restore,
+  commit,
+  commitTurn,
   retry,
   reroll,
   openVersion,
@@ -180,11 +255,7 @@ export function MessageEditTimelineView({
   const [cascade, setCascade] = useState<CascadePolicy>('truncate')
   const [editing, setEditing] = useState<EditingState | null>(null)
 
-  useEffect(() => {
-    const release = acquire()
-    load()
-    return release
-  }, [acquire, load])
+  useEffect(() => { load() }, [load])
 
   const timeline = state.timeline
   const sections = useMemo(
@@ -213,9 +284,20 @@ export function MessageEditTimelineView({
   }
   if (timeline === null) return null
 
-  const applyEdit = (message: EditableMessageBlock, text: string, policy: CascadePolicy): void => {
+  const saveEdit = (message: EditableMessageBlock, text: string): void => {
+    save(message, text)
     setEditing(null)
-    void edit(message, text, policy)
+  }
+
+  const commitEdit = async (message: EditableMessageBlock, text: string, policy: CascadePolicy): Promise<boolean> => {
+    const applied = await commit(message, text, policy)
+    if (applied) setEditing(null)
+    return applied
+  }
+
+  const deleteEdit = (message: EditableMessageBlock): void => {
+    deleteDraft(message)
+    setEditing(current => current?.message.eventSeq === message.eventSeq ? null : current)
   }
 
   return (
@@ -315,14 +397,30 @@ export function MessageEditTimelineView({
                         <h3 className={styles['turnTitle']}>回合 {String(section.retry.turn)}</h3>
                         <p className={styles['turnPreview']}>{section.retry.preview || '（空用户输入）'}</p>
                       </div>
-                      <button
-                        type="button"
-                        className={styles['secondaryButton']}
-                        disabled={busy}
-                        onClick={() => { void retry(section.retry.turn, cascade) }}
-                      >
-                        {state.pending === 'retry' ? '正在重试…' : '重试此回合'}
-                      </button>
+                      <div className={styles['turnActions']}>
+                        {section.retry.retryable
+                          ? (
+                            <button
+                              type="button"
+                              className={styles['secondaryButton']}
+                              disabled={busy}
+                              onClick={() => { void retry(section.retry.turn, cascade) }}
+                            >
+                              {state.pending === 'retry' ? '正在重试…' : '重试此回合'}
+                            </button>
+                          )
+                          : null}
+                        <button
+                          type="button"
+                          className={styles['primaryButton']}
+                          disabled={busy || turnDraftCount(section.messages, state.drafts.textByKey, state.drafts.deletedEventSeqs) === 0}
+                          onClick={() => { void commitTurn(section.retry.turn, cascade) }}
+                        >
+                          {state.pending === 'edit'
+                            ? '正在保存并重新生成…'
+                            : `保存并重新生成 (${String(turnDraftCount(section.messages, state.drafts.textByKey, state.drafts.deletedEventSeqs))})`}
+                        </button>
+                      </div>
                     </div>
                     <div className={styles['messageList']}>
                       {section.messages.map(message => (
@@ -330,14 +428,21 @@ export function MessageEditTimelineView({
                           key={message.key}
                           message={message}
                           editing={editing}
+                          textByKey={state.drafts.textByKey}
+                          deletedEventSeqs={state.drafts.deletedEventSeqs}
                           disabled={busy}
                           cascade={cascade}
-                          onBeginEdit={value => { setEditing({ message: value, text: value.text }) }}
+                          onBeginEdit={value => {
+                            setEditing({ message: value, text: draftedText(value, state.drafts.textByKey) })
+                          }}
                           onCancelEdit={() => { setEditing(null) }}
                           onTextChange={(text) => {
                             setEditing(current => current === null ? null : { ...current, text })
                           }}
-                          onApplyEdit={applyEdit}
+                          onSave={saveEdit}
+                          onCommit={commitEdit}
+                          onDelete={deleteEdit}
+                          onRestore={restore}
                         />
                       ))}
                     </div>

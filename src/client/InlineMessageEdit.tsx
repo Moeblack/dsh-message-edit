@@ -7,7 +7,7 @@
  */
 import { useEffect } from 'react'
 import type { EditableMessageBlock } from '../shared.ts'
-import type { MessageEditFace } from './controller.ts'
+import type { MessageEditDrafts, MessageEditFace } from './controller.ts'
 import styles from './InlineMessageEdit.module.css'
 
 const BLOCK_TITLE: Record<EditableMessageBlock['kind'], string> = {
@@ -26,6 +26,8 @@ const STYLE = {
   picker: styles['picker'] ?? '',
   pickerItem: styles['pickerItem'] ?? '',
   pickerItemActive: styles['pickerItemActive'] ?? '',
+  primaryButton: styles['primaryButton'] ?? '',
+  dangerButton: styles['dangerButton'] ?? '',
 }
 
 /** Official ic_ds_refresh_outline_16 path (dsh-client-ui-primitives). */
@@ -56,7 +58,10 @@ type OverlayCleanup = () => void
 /** Mount one editor DOM effect and return its exact inverse. */
 function mountEditor(
   block: EditableMessageBlock,
-  edit: MessageEditFace['edit'],
+  text: string,
+  saveDraft: MessageEditFace['save'],
+  deleteDraft: MessageEditFace['delete'],
+  commit: MessageEditFace['commit'],
   close: () => void,
 ): OverlayCleanup {
   const overlay = document.createElement('div')
@@ -68,43 +73,67 @@ function mountEditor(
   title.textContent = blockTitle(block.kind)
   const input = document.createElement('textarea')
   input.className = STYLE.input
-  input.value = block.text
+  input.value = text
   const footer = document.createElement('div')
   footer.className = STYLE.footer
   const save = document.createElement('button')
   save.textContent = '保存'
+  const apply = document.createElement('button')
+  apply.className = STYLE.primaryButton
+  apply.textContent = '保存并重新生成'
+  const remove = document.createElement('button')
+  remove.className = STYLE.dangerButton
+  remove.textContent = '删除'
   const cancel = document.createElement('button')
   cancel.textContent = '取消'
-  footer.append(save, cancel)
+  footer.append(save)
+  footer.append(remove)
+  footer.append(apply, cancel)
   panel.append(title, input, footer)
   overlay.appendChild(panel)
   document.body.appendChild(overlay)
   input.focus()
   input.setSelectionRange(input.value.length, input.value.length)
   let mounted = true
-  let saving = false
+  let committing = false
   const saveEdit = (): void => {
-    if (saving) return
-    saving = true
+    if (committing) return
+    saveDraft(block, input.value)
+    close()
+  }
+  const commitEdit = (): void => {
+    if (committing) return
+    committing = true
     save.disabled = true
-    void edit(block, input.value, 'truncate').then((applied) => {
+    apply.disabled = true
+    void commit(block, input.value, 'truncate').then((applied) => {
       if (!mounted) return
       if (applied) {
         close()
         return
       }
-      saving = false
+      committing = false
       save.disabled = false
+      apply.disabled = false
     })
+  }
+  const deleteEdit = (): void => {
+    if (committing) return
+    deleteDraft(block)
+    close()
   }
   const cancelEdit = (): void => { close() }
   const dismiss = (event: MouseEvent): void => { if (event.target === overlay) close() }
   save.addEventListener('click', saveEdit)
+  remove.addEventListener('click', deleteEdit)
+  apply.addEventListener('click', commitEdit)
   cancel.addEventListener('click', cancelEdit)
   overlay.addEventListener('click', dismiss)
   return () => {
     mounted = false
     save.removeEventListener('click', saveEdit)
+    remove.removeEventListener('click', deleteEdit)
+    apply.removeEventListener('click', commitEdit)
     cancel.removeEventListener('click', cancelEdit)
     overlay.removeEventListener('click', dismiss)
     overlay.remove()
@@ -152,7 +181,12 @@ function mountPicker(
 }
 
 /** Compose every overlay with a single idempotent active inverse. */
-function createOverlayHost(edit: MessageEditFace['edit']): {
+function createOverlayHost(
+  saveDraft: MessageEditFace['save'],
+  deleteDraft: MessageEditFace['delete'],
+  commit: MessageEditFace['commit'],
+  drafts: MessageEditDrafts,
+): {
   editBlock(block: EditableMessageBlock): void
   chooseBlock(blocks: readonly EditableMessageBlock[]): void
   dispose(): void
@@ -178,7 +212,7 @@ function createOverlayHost(edit: MessageEditFace['edit']): {
     }
   }
   const editBlock = (block: EditableMessageBlock): void => {
-    mount(close => mountEditor(block, edit, close))
+    mount(close => mountEditor(block, drafts.textByKey[block.key] ?? block.text, saveDraft, deleteDraft, commit, close))
   }
   const chooseBlock = (blocks: readonly EditableMessageBlock[]): void => {
     mount(close => mountPicker(blocks, (block) => {
@@ -196,20 +230,23 @@ function createOverlayHost(edit: MessageEditFace['edit']): {
 /** Inject retry + edit icon buttons into each message action row. */
 export function InlineMessageEdit({
   messages,
-  edit,
+  drafts,
+  save,
+  delete: deleteDraft,
+  commit,
   retry,
 }: {
   messages: readonly EditableMessageBlock[]
-  edit: MessageEditFace['edit']
+  drafts: MessageEditDrafts
+  save: MessageEditFace['save']
+  delete: MessageEditFace['delete']
+  commit: MessageEditFace['commit']
   retry: MessageEditFace['retry']
 }): null {
   useEffect(() => {
     const cleanups: Array<() => void> = []
-    const overlays = createOverlayHost(edit)
+    const overlays = createOverlayHost(save, deleteDraft, commit, drafts)
     let observer: MutationObserver | undefined
-    let alive = true
-    let frame: number | undefined
-    let scheduled = false
 
     const sync = (): void => {
       const actionRows = Array.from(document.querySelectorAll<HTMLElement>('[class*="actions"]'))
@@ -286,25 +323,15 @@ export function InlineMessageEdit({
     }
 
     sync()
-    observer = new MutationObserver(() => {
-      if (!alive || scheduled) return
-      scheduled = true
-      frame = requestAnimationFrame(() => {
-        frame = undefined
-        scheduled = false
-        if (alive) sync()
-      })
-    })
+    observer = new MutationObserver(sync)
     observer.observe(document.body, { childList: true, subtree: true })
 
     return () => {
-      alive = false
-      if (frame !== undefined) cancelAnimationFrame(frame)
       observer?.disconnect()
       overlays.dispose()
       for (const cleanup of cleanups.reverse()) cleanup()
     }
-  }, [messages, edit, retry])
+  }, [messages, drafts, save, deleteDraft, commit, retry])
 
   return null
 }
