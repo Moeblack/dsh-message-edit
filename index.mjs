@@ -267,12 +267,13 @@ function inheritedSeed(source, boundary) {
 	return source.events.slice(0, boundary + 1);
 }
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
-function appendLogSeedEvent(events, type, data) {
+function appendLogSeedEvent(events, type, data, ignorable) {
 	events.push({
 		type,
 		seq: events.length,
 		time: Date.now(),
-		data
+		data,
+		...ignorable === true ? { ignorable: true } : {}
 	});
 }
 function appendSurfaceSeedEvent(events, type, data, intent) {
@@ -313,7 +314,7 @@ function appendManualTurn(events, manual) {
 function versionSeed(source, plan) {
 	const events = inheritedSeed(source, plan.boundary);
 	const inheritedLength = events.length;
-	appendLogSeedEvent(events, "message-edit/version", plan.version);
+	appendLogSeedEvent(events, "message-edit/version", plan.version, true);
 	if (plan.manualTurn !== void 0) appendManualTurn(events, plan.manualTurn);
 	return {
 		events,

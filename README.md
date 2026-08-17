@@ -21,6 +21,10 @@ dsh plugin --profile web add dsh-message-edit
 - **版本切换**：会话标题栏的 `←` 撤销当前原子效果，`→` 重施加最新直接子效果；Timeline 展示完整已知分支树、操作时间、编辑前后内容与当前版本。
 - **Timeline 标签页**：注册到 `conversation.view`，`order: 15`，位于 Trajectory（10）与 Prompt Studio（20）之间。
 
+## 兼容性
+
+`message-edit/version` 是插件自有事件类型，不在 harness 的硬编码 `KNOWN_SESSION_EVENT_TYPES` 中。该事件现在带 `ignorable: true` 标记（harness `SessionEvent.ignorable` 契约，见 `dsh-session` 类型注释）：不识别此类型的读取方会安全跳过这条纯信息性溯源记录，而不是用 `SessionFormatUnsupportedError` 拒绝整个会话日志。需要 harness `>= 0.1.0-rc.6`（首个支持 `ignorable` envelope 标记的版本）。0.2.3 及更早版本写入的会话日志若包含未标记的 `message-edit/version` 事件，重启时仍会被拒绝，需一次性剔除这些事件行（先备份）。
+
 ## 设计
 
 ### 时间可组合性
