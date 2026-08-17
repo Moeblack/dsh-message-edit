@@ -441,8 +441,15 @@ function appendLogSeedEvent<T extends Exclude<SessionEventType, SurfaceEventType
   events: SessionEvent[],
   type: T,
   data: SessionEvent<T>['data'],
+  ignorable?: boolean,
 ): void {
-  events.push({ type, seq: events.length, time: Date.now(), data } as SessionEvent<T>)
+  events.push({
+    type,
+    seq: events.length,
+    time: Date.now(),
+    data,
+    ...(ignorable === true ? { ignorable: true as const } : {}),
+  } as SessionEvent<T>)
 }
 
 function appendSurfaceSeedEvent<T extends SurfaceEventType>(
@@ -480,7 +487,12 @@ function versionSeed(source: Session, plan: OperationPlan): {
 } {
   const events = inheritedSeed(source, plan.boundary)
   const inheritedLength = events.length
-  appendLogSeedEvent(events, 'message-edit/version', plan.version)
+  // `message-edit/version` is a plugin-owned type outside the harness's
+  // KNOWN_SESSION_EVENT_TYPES; mark it ignorable so a reader that does not
+  // know the type (e.g. a plain 0.1.0-rc.6 restart) skips the record instead
+  // of refusing the whole log with SessionFormatUnsupportedError. The record
+  // is purely informational provenance — reconstruction never depends on it.
+  appendLogSeedEvent(events, 'message-edit/version', plan.version, true)
   if (plan.manualTurn !== undefined) appendManualTurn(events, plan.manualTurn)
   return { events, inheritedLength }
 }
