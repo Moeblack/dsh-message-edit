@@ -442,7 +442,18 @@ function appendLogSeedEvent<T extends Exclude<SessionEventType, SurfaceEventType
   type: T,
   data: SessionEvent<T>['data'],
 ): void {
-  events.push({ type, seq: events.length, time: Date.now(), data } as SessionEvent<T>)
+  events.push({
+    type,
+    seq: events.length,
+    time: Date.now(),
+    data,
+    // Plugin-owned types (message-edit/*) live outside the harness event
+    // vocabulary, so the persistence read path refuses the whole log after a
+    // restart unless the envelope carries this marker. The seed envelope is
+    // the only public surface that accepts it — Session.append() cannot set
+    // it. The prefix check keeps every future plugin event marked by default.
+    ...type.startsWith('message-edit/') ? { ignorable: true } : {},
+  } as SessionEvent<T>)
 }
 
 function appendSurfaceSeedEvent<T extends SurfaceEventType>(

@@ -272,7 +272,8 @@ function appendLogSeedEvent(events, type, data) {
 		type,
 		seq: events.length,
 		time: Date.now(),
-		data
+		data,
+		...type.startsWith("message-edit/") ? { ignorable: true } : {}
 	});
 }
 function appendSurfaceSeedEvent(events, type, data, intent) {
