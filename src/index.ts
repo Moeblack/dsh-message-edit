@@ -442,7 +442,13 @@ function appendLogSeedEvent<T extends Exclude<SessionEventType, SurfaceEventType
   type: T,
   data: SessionEvent<T>['data'],
 ): void {
-  events.push({ type, seq: events.length, time: Date.now(), data } as SessionEvent<T>)
+  // `message-edit/version` is plugin-owned log metadata outside the core event vocabulary.
+  // Without `ignorable: true`, every harness build whose KNOWN_SESSION_EVENT_TYPES lacks this
+  // type rejects the whole branched session with SessionFormatUnsupportedError — the branch
+  // becomes unloadable even though the log itself is intact. Mark it ignorable so any build
+  // can still load the session (the core skips unknown-but-ignorable events by design).
+  const ignorable = type === 'message-edit/version' ? { ignorable: true as const } : {}
+  events.push({ type, seq: events.length, time: Date.now(), data, ...ignorable } as SessionEvent<T>)
 }
 
 function appendSurfaceSeedEvent<T extends SurfaceEventType>(

@@ -268,11 +268,13 @@ function inheritedSeed(source, boundary) {
 }
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
 function appendLogSeedEvent(events, type, data) {
+	const ignorable = type === "message-edit/version" ? { ignorable: true } : {};
 	events.push({
 		type,
 		seq: events.length,
 		time: Date.now(),
-		data
+		data,
+		...ignorable
 	});
 }
 function appendSurfaceSeedEvent(events, type, data, intent) {
