@@ -38,9 +38,7 @@ const VENDORED_LIBRARY = /^@deepseek-ai\/(cosmokit|schemastery)(\/|$)/
 const GENERATED_REMOTE = /^@deepseek-ai\/dsh-[a-z0-9]+(?:-[a-z0-9]+)*\/remote$/
 
 /**
- * Mirrors `PLATFORM_MODULES` from @deepseek-ai/dsh-client-web (verified
- * identical in 0.0.1-rc.5 and 0.1.0-rc.6): the module specifiers the shell
- * seeds into the frozen module table.
+ * Mirrors the browser platform modules seeded by current DSH builds.
  */
 export const PLATFORM_MODULES: readonly string[] = [
   'react',
@@ -56,12 +54,10 @@ export const PLATFORM_MODULES: readonly string[] = [
 ]
 
 /**
- * The snapshot-store engine (createSnapshotStore/defineStore/shallowEqual)
- * lives in runtime pending its promotion-time rehoming; at runtime the lazy
- * CJS table answers the require natively because runtime is an immediately-tier
- * row registered before any dependent bundle materializes.
+ * The snapshot-store engine is a separately seeded browser module in current
+ * DSH builds; keep it external so the plugin shares the host store identity.
  */
-const RUNTIME_STORE_EXEMPTION = '@deepseek-ai/dsh-client-runtime/client'
+const RUNTIME_STORE_EXEMPTION = '@deepseek-ai/dsh-client-store'
 
 /** Externals resolved from the loader module table. */
 export const CLIENT_EXTERNALS: readonly string[] = [...PLATFORM_MODULES, RUNTIME_STORE_EXEMPTION]

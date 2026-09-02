@@ -1,7 +1,6 @@
 /** Browser controller for one session's Timeline projection and branch mutations. */
 import type {
   ClientContext,
-  ConversationSnapshot,
   ISessions,
   ObservableSnapshot,
   SessionFace,
@@ -9,7 +8,7 @@ import type {
   SessionListState,
   SnapshotStore,
 } from '@deepseek-ai/dsh-client-runtime/client'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import {
   MESSAGE_EDIT_PATH,
   type CascadePolicy,
@@ -175,11 +174,34 @@ async function responseValue(response: Response): Promise<unknown> {
   throw new Error(typeof error === 'string' ? error : `请求失败：HTTP ${String(response.status)}`)
 }
 
-function conversationRevision(snapshot: ConversationSnapshot): string {
-  const turnEnds = [...snapshot.turnEnds.entries()]
-    .map(([turn, seq]) => `${String(turn)}:${String(seq)}`)
+interface CurrentSessionSnapshot {
+  openState: string
+  removed: boolean
+  hasMore: boolean
+  running?: boolean
+  blank?: boolean
+  loadingOlder?: boolean
+  queue?: readonly { id: string; placement: string; text: string | null }[]
+  pendingSubmissions?: readonly { requestId: string; placement: string }[]
+}
+
+function conversationRevision(snapshot: CurrentSessionSnapshot): string {
+  const queue = snapshot.queue === undefined ? '' : snapshot.queue
+    .map(item => [item.id, item.placement, item.text ?? ''].join(':'))
     .join(',')
-  return [snapshot.openState, snapshot.removed, snapshot.hasMore, turnEnds].join('|')
+  const pending = snapshot.pendingSubmissions === undefined ? '' : snapshot.pendingSubmissions
+    .map(item => [item.requestId, item.placement].join(':'))
+    .join(',')
+  return [
+    snapshot.openState,
+    snapshot.removed,
+    snapshot.hasMore,
+    snapshot.running,
+    snapshot.blank,
+    snapshot.loadingOlder,
+    queue,
+    pending,
+  ].join('|')
 }
 
 function lineageRevision(snapshot: SessionListState, sessionId: SessionId): string {
@@ -336,10 +358,12 @@ export class MessageEditController {
     if (source === this.sessionSource) return false
     this.sessionSourceDispose?.()
     this.sessionSource = source
-    this.sessionRevision = source === undefined ? undefined : conversationRevision(source.getSnapshot())
+    this.sessionRevision = source === undefined
+      ? undefined
+      : conversationRevision(source.getSnapshot() as unknown as CurrentSessionSnapshot)
     this.sessionSourceDispose = source?.subscribe(() => {
       if (this.sessionSource !== source) return
-      const revision = conversationRevision(source.getSnapshot())
+      const revision = conversationRevision(source.getSnapshot() as unknown as CurrentSessionSnapshot)
       if (revision === this.sessionRevision) return
       this.sessionRevision = revision
       this.invalidate()
