@@ -21,8 +21,10 @@ function run(command, args) {
 
 const dist = join(pluginRoot, 'dist')
 await rm(dist, { recursive: true, force: true })
-await run(join(pluginRoot, 'node_modules/.bin/tsc'), ['-p', 'tsconfig.json'])
-await run(join(pluginRoot, 'node_modules/.bin/tsdown'), ['--config', 'tsdown.config.ts'])
+// Windows 上直接 spawn 无扩展名的 node_modules/.bin 脚本会得到 ENOENT；
+// 统一由当前 Node 进程执行真实的 JS 入口，保证 npm run build 跨平台一致。
+await run(process.execPath, [join(pluginRoot, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.json'])
+await run(process.execPath, [join(pluginRoot, 'node_modules/tsdown/dist/run.mjs'), '--config', 'tsdown.config.ts'])
 await copyFile(join(dist, 'index.js'), join(pluginRoot, 'index.mjs'))
 await copyFile(join(dist, 'client.js'), join(pluginRoot, 'client.js'))
 await copyFile(join(dist, 'client.js.map'), join(pluginRoot, 'client.js.map'))
