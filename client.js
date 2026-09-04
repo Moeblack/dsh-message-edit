@@ -4,12 +4,231 @@ window.__ModuleLoader__.load({
 		var module = { exports: {} };
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
-		let _deepseek_ai_dsh_client_runtime_client = require("@deepseek-ai/dsh-client-runtime/client");
 		let react = require("react");
+		let react_dom = require("react-dom");
+		let _deepseek_ai_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");
 		let react_jsx_runtime = require("react/jsx-runtime");
+		let _deepseek_ai_dsh_client_store = require("@deepseek-ai/dsh-client-store");
 		//#region src/shared.ts
 		/** Same-origin endpoint owned by the Message Edit host plugin. */
 		const MESSAGE_EDIT_PATH = "/message-edit";
+		//#endregion
+		//#region \0dsh-css:F:\codefile\dsh-message-edit\src\client\AssistantMessageEdit.module.css.mjs
+		const css$3 = ".QXAAta_action{width:20px;height:20px;color:var(--dsw-text-secondary,#7a7a85);cursor:pointer;background:0 0;border:none;border-radius:6px;justify-content:center;align-items:center;padding:0;display:inline-flex}.QXAAta_action:hover{background:var(--dsw-hover,#8080911f);color:var(--dsw-text-primary,#2a2a33)}.QXAAta_panel{z-index:60;background:var(--dsw-surface,#fff);border:1px solid var(--dsw-border,#8080913d);width:min(560px,100vw - 24px);color:var(--dsw-text-primary,#2a2a33);border-radius:12px;padding:12px;position:fixed;box-shadow:0 8px 30px #0000002e}.QXAAta_panelTitle{margin-bottom:8px;font-size:13px;font-weight:600}.QXAAta_input{border:1px solid var(--dsw-border,#8080914d);background:var(--dsw-input,#8080910f);width:100%;min-height:120px;color:var(--dsw-text-primary,#2a2a33);font:inherit;resize:vertical;box-sizing:border-box;border-radius:8px;outline:none;padding:8px 10px;font-size:13px;line-height:1.5}.QXAAta_input:focus{border-color:var(--dsw-accent,#4b6bfb)}.QXAAta_policy{gap:6px;margin-top:8px;display:flex}.QXAAta_policy button{border:1px solid var(--dsw-border,#8080914d);color:var(--dsw-text-secondary,#6a6a76);font:inherit;cursor:pointer;background:0 0;border-radius:8px;flex:1;padding:5px 8px;font-size:12px}.QXAAta_policyActive{border-color:var(--dsw-accent,#4b6bfb)!important;color:var(--dsw-accent,#4b6bfb)!important;background:var(--dsw-accent-soft,#4b6bfb14)!important}.QXAAta_hint{color:var(--dsw-text-tertiary,#9a9aa6);margin-top:6px;font-size:11px;line-height:1.5}.QXAAta_actions{justify-content:flex-end;gap:8px;margin-top:10px;display:flex}.QXAAta_actions button{font:inherit;cursor:pointer;border:none;border-radius:8px;padding:6px 14px;font-size:12px}.QXAAta_save{background:var(--dsw-accent,#4b6bfb);color:#fff}.QXAAta_save:disabled{opacity:.5;cursor:default}.QXAAta_cancel{background:var(--dsw-hover,#8080911f);color:var(--dsw-text-primary,#2a2a33)}.QXAAta_failure{color:#d64545;margin-top:8px;font-size:12px}";
+		const tagId$3 = "dsh-message-edit/AssistantMessageEdit.module.css";
+		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId$3) + "]") === null) {
+			const tag = document.createElement("style");
+			tag.dataset.plugin = "dsh-message-edit";
+			tag.dataset.pluginCss = tagId$3;
+			tag.textContent = css$3;
+			document.head.appendChild(tag);
+		}
+		var AssistantMessageEdit_module_css_default = {
+			"policyActive": "QXAAta_policyActive",
+			"hint": "QXAAta_hint",
+			"actions": "QXAAta_actions",
+			"save": "QXAAta_save",
+			"panelTitle": "QXAAta_panelTitle",
+			"action": "QXAAta_action",
+			"input": "QXAAta_input",
+			"panel": "QXAAta_panel",
+			"policy": "QXAAta_policy",
+			"cancel": "QXAAta_cancel",
+			"failure": "QXAAta_failure"
+		};
+		//#endregion
+		//#region src/client/AssistantMessageEdit.tsx
+		/**
+		* Per-message bubble edit entry for finalized assistant messages: contributes
+		* one action to the `conversation.chat.assistant-actions` strip. Clicking it
+		* opens a portaled textarea seeded with the message's current response text;
+		* saving rewrites the whole response (reasoning preserved) by forking a new
+		* session version through the host `/message-edit` endpoint.
+		*/
+		const PANEL_MARGIN = 12;
+		const PANEL_GAP = 4;
+		const MEASURE_STYLE = {
+			visibility: "hidden",
+			left: 0,
+			top: 0
+		};
+		/** Edit affordance mounted once per finalized assistant message. */
+		function AssistantMessageEdit({ messageId, loadText, submit }) {
+			const [open, setOpen] = (0, react.useState)(false);
+			const [loading, setLoading] = (0, react.useState)(false);
+			const [pending, setPending] = (0, react.useState)(false);
+			const [draft, setDraft] = (0, react.useState)("");
+			const [cascade, setCascade] = (0, react.useState)("truncate");
+			const [failure, setFailure] = (0, react.useState)(null);
+			const triggerRef = (0, react.useRef)(null);
+			const panelRef = (0, react.useRef)(null);
+			const inputRef = (0, react.useRef)(null);
+			const alive = (0, react.useRef)(true);
+			(0, react.useEffect)(() => () => {
+				alive.current = false;
+			}, []);
+			const openEditor = (0, react.useCallback)(() => {
+				setOpen(true);
+				setLoading(true);
+				setFailure(null);
+				setCascade("truncate");
+				loadText(messageId).then((result) => {
+					if (!alive.current) return;
+					setLoading(false);
+					if (result.ok) {
+						setDraft(result.text ?? "");
+						return;
+					}
+					setFailure(result.error);
+				});
+			}, [loadText, messageId]);
+			const closeEditor = (0, react.useCallback)(() => {
+				setOpen(false);
+				setPending(false);
+				setFailure(null);
+			}, []);
+			const save = (0, react.useCallback)(() => {
+				if (pending || loading) return;
+				setPending(true);
+				setFailure(null);
+				submit(messageId, draft, cascade).then((result) => {
+					if (!alive.current) return;
+					setPending(false);
+					if (result.ok) {
+						setOpen(false);
+						return;
+					}
+					setFailure(result.error);
+				});
+			}, [
+				cascade,
+				draft,
+				loading,
+				messageId,
+				pending,
+				submit
+			]);
+			const pos = (0, _deepseek_ai_dsh_client_ui_primitives.useAnchoredPosition)({
+				open,
+				anchorRef: triggerRef,
+				panelRef,
+				gap: PANEL_GAP,
+				margin: PANEL_MARGIN
+			});
+			(0, react.useEffect)(() => {
+				if (!open) return;
+				inputRef.current?.focus();
+				const onPointerDown = (e) => {
+					if (!(e.target instanceof Node)) return;
+					if (triggerRef.current?.contains(e.target) === true) return;
+					if (panelRef.current?.contains(e.target) === true) return;
+					closeEditor();
+				};
+				const onKeyDown = (e) => {
+					if (e.key === "Escape") closeEditor();
+					if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save();
+				};
+				document.addEventListener("pointerdown", onPointerDown);
+				document.addEventListener("keydown", onKeyDown);
+				return () => {
+					document.removeEventListener("pointerdown", onPointerDown);
+					document.removeEventListener("keydown", onKeyDown);
+				};
+			}, [
+				open,
+				closeEditor,
+				save
+			]);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Tooltip, {
+				label: "编辑此回复",
+				side: "bottom",
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+					ref: triggerRef,
+					type: "button",
+					className: AssistantMessageEdit_module_css_default["action"],
+					"aria-label": "编辑此回复",
+					"aria-haspopup": "dialog",
+					"aria-expanded": open,
+					onClick: openEditor,
+					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconEditOutline16, { size: 16 })
+				})
+			}), open && (0, react_dom.createPortal)(/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				ref: panelRef,
+				className: AssistantMessageEdit_module_css_default["panel"],
+				role: "dialog",
+				"aria-label": "编辑助手回复",
+				style: pos ?? MEASURE_STYLE,
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: AssistantMessageEdit_module_css_default["panelTitle"],
+						children: "编辑助手回复"
+					}),
+					loading ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: AssistantMessageEdit_module_css_default["hint"],
+						children: "正在读取原文…"
+					}) : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
+							ref: inputRef,
+							className: AssistantMessageEdit_module_css_default["input"],
+							"aria-label": "回复文本",
+							value: draft,
+							rows: 6,
+							spellCheck: false,
+							onChange: (event) => {
+								setDraft(event.target.value);
+							}
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: AssistantMessageEdit_module_css_default["policy"],
+							role: "group",
+							"aria-label": "后续策略",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: cascade === "truncate" ? AssistantMessageEdit_module_css_default["policyActive"] : AssistantMessageEdit_module_css_default["policyIdle"],
+								disabled: pending,
+								onClick: () => {
+									setCascade("truncate");
+								},
+								children: "截断后续"
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: cascade === "preserve" ? AssistantMessageEdit_module_css_default["policyActive"] : AssistantMessageEdit_module_css_default["policyIdle"],
+								disabled: pending,
+								onClick: () => {
+									setCascade("preserve");
+								},
+								children: "保留输入并重放后续"
+							})]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: AssistantMessageEdit_module_css_default["hint"],
+							children: "保存后将保留思考链，从该回合边界重放为新版本会话，原版本可随时切回。"
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: AssistantMessageEdit_module_css_default["actions"],
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: AssistantMessageEdit_module_css_default["save"],
+								disabled: pending || draft.trim().length === 0,
+								onClick: save,
+								children: pending ? "保存中…" : "保存并重放"
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: AssistantMessageEdit_module_css_default["cancel"],
+								disabled: pending,
+								onClick: closeEditor,
+								children: "取消"
+							})]
+						})
+					] }),
+					failure !== null && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: AssistantMessageEdit_module_css_default["failure"],
+						role: "status",
+						children: failure
+					})
+				]
+			}), document.body)] });
+		}
 		//#endregion
 		//#region src/client/controller.ts
 		/** Merge a burst of turn completions into one refresh. */
@@ -117,14 +336,8 @@ window.__ModuleLoader__.load({
 			const error = objectValue(value, "错误响应")["error"];
 			throw new Error(typeof error === "string" ? error : `请求失败：HTTP ${String(response.status)}`);
 		}
-		function conversationRevision(snapshot) {
-			const turnEnds = [...snapshot.turnEnds.entries()].map(([turn, seq]) => `${String(turn)}:${String(seq)}`).join(",");
-			return [
-				snapshot.openState,
-				snapshot.removed,
-				snapshot.hasMore,
-				turnEnds
-			].join("|");
+		function eventRevision(source) {
+			return String(source.getSnapshot().revision);
 		}
 		function lineageRevision(snapshot, sessionId) {
 			let root = sessionId;
@@ -154,7 +367,7 @@ window.__ModuleLoader__.load({
 		/** One stable controller is shared by all entries mounted for the same session. */
 		var MessageEditController = class {
 			sessionId;
-			store = (0, _deepseek_ai_dsh_client_runtime_client.createSnapshotStore)({
+			store = (0, _deepseek_ai_dsh_client_store.createSnapshotStore)({
 				status: "idle",
 				error: null,
 				pending: null,
@@ -267,14 +480,14 @@ window.__ModuleLoader__.load({
 				};
 			}
 			bindSessionSource() {
-				const source = this.sessions.binding(this.sessionId)?.session;
+				const source = this.sessions.binding(this.sessionId)?.eventSource;
 				if (source === this.sessionSource) return false;
 				this.sessionSourceDispose?.();
 				this.sessionSource = source;
-				this.sessionRevision = source === void 0 ? void 0 : conversationRevision(source.getSnapshot());
+				this.sessionRevision = source === void 0 ? void 0 : eventRevision(source);
 				this.sessionSourceDispose = source?.subscribe(() => {
 					if (this.sessionSource !== source) return;
-					const revision = conversationRevision(source.getSnapshot());
+					const revision = eventRevision(source);
 					if (revision === this.sessionRevision) return;
 					this.sessionRevision = revision;
 					this.invalidate();
@@ -413,8 +626,8 @@ window.__ModuleLoader__.load({
 			}
 		};
 		//#endregion
-		//#region \0dsh-css:/home/moeblack/repos/dsh-message-edit/src/client/InlineMessageEdit.module.css.mjs
-		const css$2 = ".Kad6XG_overlay{z-index:1000;background:var(--dsw-alias-bg-mask,#00000073);justify-content:center;align-items:center;display:flex;position:fixed;inset:0}.Kad6XG_panel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);border-radius:10px;width:560px;padding:14px 16px}.Kad6XG_title{color:var(--dsw-alias-label-primary);padding:4px 0 10px;font-size:13px}.Kad6XG_input{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);width:100%;min-height:160px;color:var(--dsw-alias-label-primary);font:inherit;resize:vertical;border-radius:8px;padding:10px}.Kad6XG_footer{justify-content:flex-end;gap:8px;padding:10px 0 0;display:flex}.Kad6XG_footer button{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;padding:6px 14px}.Kad6XG_iconButton{width:20px;height:20px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:none;border-radius:4px;justify-content:center;align-items:center;padding:2px;display:inline-flex}.Kad6XG_iconButton:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-hover)}.Kad6XG_picker{flex-direction:column;gap:6px;padding:4px 0 12px;display:flex}.Kad6XG_pickerItem{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);text-align:left;cursor:pointer;border-radius:6px;padding:8px 10px;font-size:12px}.Kad6XG_pickerItem:hover{background:var(--dsw-alias-bg-module-platform)}.Kad6XG_pickerItemActive{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;align-self:flex-end;padding:6px 14px}";
+		//#region \0dsh-css:F:\codefile\dsh-message-edit\src\client\InlineMessageEdit.module.css.mjs
+		const css$2 = ".vxemLq_overlay{z-index:1000;background:var(--dsw-alias-bg-mask,#00000073);justify-content:center;align-items:center;display:flex;position:fixed;inset:0}.vxemLq_panel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);border-radius:10px;width:560px;padding:14px 16px}.vxemLq_title{color:var(--dsw-alias-label-primary);padding:4px 0 10px;font-size:13px}.vxemLq_input{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);width:100%;min-height:160px;color:var(--dsw-alias-label-primary);font:inherit;resize:vertical;border-radius:8px;padding:10px}.vxemLq_footer{justify-content:flex-end;gap:8px;padding:10px 0 0;display:flex}.vxemLq_footer button{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;padding:6px 14px}.vxemLq_iconButton{width:20px;height:20px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:none;border-radius:4px;justify-content:center;align-items:center;padding:2px;display:inline-flex}.vxemLq_iconButton:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-hover)}.vxemLq_picker{flex-direction:column;gap:6px;padding:4px 0 12px;display:flex}.vxemLq_pickerItem{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);text-align:left;cursor:pointer;border-radius:6px;padding:8px 10px;font-size:12px}.vxemLq_pickerItem:hover{background:var(--dsw-alias-bg-module-platform)}.vxemLq_pickerItemActive{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-label-primary);cursor:pointer;border-radius:6px;align-self:flex-end;padding:6px 14px}";
 		const tagId$2 = "dsh-message-edit/InlineMessageEdit.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId$2) + "]") === null) {
 			const tag = document.createElement("style");
@@ -424,15 +637,15 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var InlineMessageEdit_module_css_default = {
-			"panel": "Kad6XG_panel",
-			"overlay": "Kad6XG_overlay",
-			"title": "Kad6XG_title",
-			"iconButton": "Kad6XG_iconButton",
-			"picker": "Kad6XG_picker",
-			"pickerItem": "Kad6XG_pickerItem",
-			"pickerItemActive": "Kad6XG_pickerItemActive",
-			"input": "Kad6XG_input",
-			"footer": "Kad6XG_footer"
+			"picker": "vxemLq_picker",
+			"panel": "vxemLq_panel",
+			"footer": "vxemLq_footer",
+			"input": "vxemLq_input",
+			"overlay": "vxemLq_overlay",
+			"title": "vxemLq_title",
+			"pickerItemActive": "vxemLq_pickerItemActive",
+			"pickerItem": "vxemLq_pickerItem",
+			"iconButton": "vxemLq_iconButton"
 		};
 		//#endregion
 		//#region src/client/InlineMessageEdit.tsx
@@ -714,8 +927,8 @@ window.__ModuleLoader__.load({
 			return null;
 		}
 		//#endregion
-		//#region \0dsh-css:/home/moeblack/repos/dsh-message-edit/src/client/MessageEditHeader.module.css.mjs
-		const css$1 = ".nFunOq_root{align-items:center;gap:4px;display:inline-flex}.nFunOq_iconButton,.nFunOq_rerollButton{box-sizing:border-box;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;background:0 0;border:0}.nFunOq_iconButton{border-radius:50%;justify-content:center;align-items:center;width:28px;height:28px;font-size:16px;line-height:20px;display:inline-flex}.nFunOq_rerollButton{border:1px solid var(--dsw-alias-border-l2);border-radius:14px;height:28px;padding:0 10px;font-size:12px;line-height:18px}.nFunOq_iconButton:hover:not(:disabled),.nFunOq_rerollButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.nFunOq_iconButton:focus-visible,.nFunOq_rerollButton:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.nFunOq_iconButton:disabled,.nFunOq_rerollButton:disabled{cursor:default;opacity:.4}.nFunOq_counter{min-width:108px;color:var(--dsw-alias-label-tertiary);text-align:center;font-size:11px;line-height:18px}@media (width<=760px){.nFunOq_counter{display:none}}";
+		//#region \0dsh-css:F:\codefile\dsh-message-edit\src\client\MessageEditHeader.module.css.mjs
+		const css$1 = ".GvNsba_root{align-items:center;gap:4px;display:inline-flex}.GvNsba_iconButton,.GvNsba_rerollButton{box-sizing:border-box;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;background:0 0;border:0}.GvNsba_iconButton{border-radius:50%;justify-content:center;align-items:center;width:28px;height:28px;font-size:16px;line-height:20px;display:inline-flex}.GvNsba_rerollButton{border:1px solid var(--dsw-alias-border-l2);border-radius:14px;height:28px;padding:0 10px;font-size:12px;line-height:18px}.GvNsba_iconButton:hover:not(:disabled),.GvNsba_rerollButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.GvNsba_iconButton:focus-visible,.GvNsba_rerollButton:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.GvNsba_iconButton:disabled,.GvNsba_rerollButton:disabled{cursor:default;opacity:.4}.GvNsba_counter{min-width:108px;color:var(--dsw-alias-label-tertiary);text-align:center;font-size:11px;line-height:18px}@media (width<=760px){.GvNsba_counter{display:none}}";
 		const tagId$1 = "dsh-message-edit/MessageEditHeader.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId$1) + "]") === null) {
 			const tag = document.createElement("style");
@@ -725,10 +938,10 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditHeader_module_css_default = {
-			"root": "nFunOq_root",
-			"counter": "nFunOq_counter",
-			"iconButton": "nFunOq_iconButton",
-			"rerollButton": "nFunOq_rerollButton"
+			"iconButton": "GvNsba_iconButton",
+			"root": "GvNsba_root",
+			"rerollButton": "GvNsba_rerollButton",
+			"counter": "GvNsba_counter"
 		};
 		//#endregion
 		//#region src/client/MessageEditHeader.tsx
@@ -792,8 +1005,8 @@ window.__ModuleLoader__.load({
 			})] });
 		}
 		//#endregion
-		//#region \0dsh-css:/home/moeblack/repos/dsh-message-edit/src/client/MessageEditTimelineView.module.css.mjs
-		const css = ".i5o6sG_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.i5o6sG_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.i5o6sG_title,.i5o6sG_intro,.i5o6sG_subtitle,.i5o6sG_notice,.i5o6sG_error,.i5o6sG_empty,.i5o6sG_turnTitle,.i5o6sG_turnPreview,.i5o6sG_messageText{margin:0}.i5o6sG_title{font-size:22px;font-weight:600;line-height:30px}.i5o6sG_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.i5o6sG_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.i5o6sG_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.i5o6sG_select,.i5o6sG_textarea,.i5o6sG_primaryButton,.i5o6sG_secondaryButton,.i5o6sG_textButton,.i5o6sG_versionButton{box-sizing:border-box;font:inherit}.i5o6sG_select,.i5o6sG_textarea{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.i5o6sG_select{height:34px;padding:0 30px 0 9px;font-size:12px}.i5o6sG_primaryButton,.i5o6sG_secondaryButton,.i5o6sG_textButton,.i5o6sG_versionButton{cursor:pointer;border:0}.i5o6sG_primaryButton,.i5o6sG_secondaryButton{border-radius:17px;justify-content:center;align-items:center;min-height:34px;padding:0 13px;font-size:12px;line-height:18px;display:inline-flex}.i5o6sG_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.i5o6sG_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.i5o6sG_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.i5o6sG_secondaryButton:hover:not(:disabled),.i5o6sG_textButton:hover:not(:disabled),.i5o6sG_versionButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.i5o6sG_primaryButton:disabled,.i5o6sG_secondaryButton:disabled,.i5o6sG_textButton:disabled,.i5o6sG_versionButton:disabled,.i5o6sG_select:disabled{cursor:default;opacity:.45}.i5o6sG_primaryButton:focus-visible,.i5o6sG_secondaryButton:focus-visible,.i5o6sG_textButton:focus-visible,.i5o6sG_versionButton:focus-visible,.i5o6sG_select:focus-visible,.i5o6sG_textarea:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.i5o6sG_notice,.i5o6sG_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.i5o6sG_notice{color:var(--dsw-alias-state-warn-label)}.i5o6sG_error{color:var(--dsw-alias-state-error-primary)}.i5o6sG_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.i5o6sG_status .i5o6sG_error{margin:0}.i5o6sG_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.i5o6sG_versionsPanel,.i5o6sG_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.i5o6sG_versionsPanel{position:sticky;top:0}.i5o6sG_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.i5o6sG_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.i5o6sG_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.i5o6sG_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.i5o6sG_effectButtons .i5o6sG_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.i5o6sG_subtitle{font-size:16px;font-weight:500;line-height:24px}.i5o6sG_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.i5o6sG_versionList,.i5o6sG_turnList{margin:0;padding:0;list-style:none}.i5o6sG_versionList{flex-direction:column;gap:4px;display:flex}.i5o6sG_versionItem{--message-edit-depth:0;padding-left:calc(var(--message-edit-depth) * 14px);position:relative}.i5o6sG_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.i5o6sG_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.i5o6sG_versionButton:not([data-current]) .i5o6sG_pathBadge{opacity:.8}.i5o6sG_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.i5o6sG_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.i5o6sG_versionButton[data-current] .i5o6sG_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.i5o6sG_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.i5o6sG_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.i5o6sG_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.i5o6sG_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.i5o6sG_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.i5o6sG_currentBadge,.i5o6sG_pathBadge,.i5o6sG_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.i5o6sG_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.i5o6sG_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.i5o6sG_turnList{flex-direction:column;gap:14px;display:flex}.i5o6sG_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.i5o6sG_turnHeader,.i5o6sG_messageHeader,.i5o6sG_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.i5o6sG_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.i5o6sG_turnTitle{font-size:14px;font-weight:500;line-height:22px}.i5o6sG_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.i5o6sG_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.i5o6sG_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.i5o6sG_messageHeader{justify-content:flex-start}.i5o6sG_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.i5o6sG_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.i5o6sG_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.i5o6sG_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.i5o6sG_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.i5o6sG_editor{margin-top:8px}.i5o6sG_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.i5o6sG_editorActions{margin-top:8px}.i5o6sG_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.i5o6sG_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}@media (width<=1000px){.i5o6sG_columns{grid-template-columns:1fr}.i5o6sG_versionsPanel{position:static}}@media (width<=680px){.i5o6sG_root{padding:16px}.i5o6sG_pageHeader,.i5o6sG_headerActions,.i5o6sG_turnHeader,.i5o6sG_editorActions{flex-direction:column;align-items:stretch}.i5o6sG_headerActions,.i5o6sG_primaryButton,.i5o6sG_secondaryButton{width:100%}}";
+		//#region \0dsh-css:F:\codefile\dsh-message-edit\src\client\MessageEditTimelineView.module.css.mjs
+		const css = ".i1EzGq_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.i1EzGq_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.i1EzGq_title,.i1EzGq_intro,.i1EzGq_subtitle,.i1EzGq_notice,.i1EzGq_error,.i1EzGq_empty,.i1EzGq_turnTitle,.i1EzGq_turnPreview,.i1EzGq_messageText{margin:0}.i1EzGq_title{font-size:22px;font-weight:600;line-height:30px}.i1EzGq_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.i1EzGq_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.i1EzGq_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.i1EzGq_select,.i1EzGq_textarea,.i1EzGq_primaryButton,.i1EzGq_secondaryButton,.i1EzGq_textButton,.i1EzGq_versionButton{box-sizing:border-box;font:inherit}.i1EzGq_select,.i1EzGq_textarea{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.i1EzGq_select{height:34px;padding:0 30px 0 9px;font-size:12px}.i1EzGq_primaryButton,.i1EzGq_secondaryButton,.i1EzGq_textButton,.i1EzGq_versionButton{cursor:pointer;border:0}.i1EzGq_primaryButton,.i1EzGq_secondaryButton{border-radius:17px;justify-content:center;align-items:center;min-height:34px;padding:0 13px;font-size:12px;line-height:18px;display:inline-flex}.i1EzGq_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.i1EzGq_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.i1EzGq_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.i1EzGq_secondaryButton:hover:not(:disabled),.i1EzGq_textButton:hover:not(:disabled),.i1EzGq_versionButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.i1EzGq_primaryButton:disabled,.i1EzGq_secondaryButton:disabled,.i1EzGq_textButton:disabled,.i1EzGq_versionButton:disabled,.i1EzGq_select:disabled{cursor:default;opacity:.45}.i1EzGq_primaryButton:focus-visible,.i1EzGq_secondaryButton:focus-visible,.i1EzGq_textButton:focus-visible,.i1EzGq_versionButton:focus-visible,.i1EzGq_select:focus-visible,.i1EzGq_textarea:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.i1EzGq_notice,.i1EzGq_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.i1EzGq_notice{color:var(--dsw-alias-state-warn-label)}.i1EzGq_error{color:var(--dsw-alias-state-error-primary)}.i1EzGq_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.i1EzGq_status .i1EzGq_error{margin:0}.i1EzGq_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.i1EzGq_versionsPanel,.i1EzGq_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.i1EzGq_versionsPanel{position:sticky;top:0}.i1EzGq_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.i1EzGq_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.i1EzGq_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.i1EzGq_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.i1EzGq_effectButtons .i1EzGq_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.i1EzGq_subtitle{font-size:16px;font-weight:500;line-height:24px}.i1EzGq_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.i1EzGq_versionList,.i1EzGq_turnList{margin:0;padding:0;list-style:none}.i1EzGq_versionList{flex-direction:column;gap:4px;display:flex}.i1EzGq_versionItem{--message-edit-depth:0;padding-left:calc(var(--message-edit-depth) * 14px);position:relative}.i1EzGq_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.i1EzGq_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.i1EzGq_versionButton:not([data-current]) .i1EzGq_pathBadge{opacity:.8}.i1EzGq_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.i1EzGq_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.i1EzGq_versionButton[data-current] .i1EzGq_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.i1EzGq_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.i1EzGq_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.i1EzGq_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.i1EzGq_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.i1EzGq_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.i1EzGq_currentBadge,.i1EzGq_pathBadge,.i1EzGq_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.i1EzGq_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.i1EzGq_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.i1EzGq_turnList{flex-direction:column;gap:14px;display:flex}.i1EzGq_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.i1EzGq_turnHeader,.i1EzGq_messageHeader,.i1EzGq_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.i1EzGq_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.i1EzGq_turnTitle{font-size:14px;font-weight:500;line-height:22px}.i1EzGq_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.i1EzGq_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.i1EzGq_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.i1EzGq_messageHeader{justify-content:flex-start}.i1EzGq_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.i1EzGq_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.i1EzGq_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.i1EzGq_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.i1EzGq_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.i1EzGq_editor{margin-top:8px}.i1EzGq_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.i1EzGq_editorActions{margin-top:8px}.i1EzGq_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.i1EzGq_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}@media (width<=1000px){.i1EzGq_columns{grid-template-columns:1fr}.i1EzGq_versionsPanel{position:static}}@media (width<=680px){.i1EzGq_root{padding:16px}.i1EzGq_pageHeader,.i1EzGq_headerActions,.i1EzGq_turnHeader,.i1EzGq_editorActions{flex-direction:column;align-items:stretch}.i1EzGq_headerActions,.i1EzGq_primaryButton,.i1EzGq_secondaryButton{width:100%}}";
 		const tagId = "dsh-message-edit/MessageEditTimelineView.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
 			const tag = document.createElement("style");
@@ -803,55 +1016,55 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditTimelineView_module_css_default = {
-			"status": "i5o6sG_status",
-			"turnPreview": "i5o6sG_turnPreview",
-			"title": "i5o6sG_title",
-			"root": "i5o6sG_root",
-			"turnTitle": "i5o6sG_turnTitle",
-			"versionMeta": "i5o6sG_versionMeta",
-			"versionItem": "i5o6sG_versionItem",
-			"versionTitle": "i5o6sG_versionTitle",
-			"messageTime": "i5o6sG_messageTime",
-			"select": "i5o6sG_select",
-			"turnList": "i5o6sG_turnList",
-			"cascadeField": "i5o6sG_cascadeField",
-			"textarea": "i5o6sG_textarea",
-			"error": "i5o6sG_error",
-			"pageHeader": "i5o6sG_pageHeader",
-			"turnsPanel": "i5o6sG_turnsPanel",
-			"versionLine": "i5o6sG_versionLine",
-			"turnHeader": "i5o6sG_turnHeader",
-			"messageList": "i5o6sG_messageList",
-			"messageCard": "i5o6sG_messageCard",
-			"secondaryButton": "i5o6sG_secondaryButton",
-			"columns": "i5o6sG_columns",
-			"editorActions": "i5o6sG_editorActions",
-			"notice": "i5o6sG_notice",
-			"textButton": "i5o6sG_textButton",
-			"empty": "i5o6sG_empty",
-			"intro": "i5o6sG_intro",
-			"effectButtons": "i5o6sG_effectButtons",
-			"effectDepth": "i5o6sG_effectDepth",
-			"pathBadge": "i5o6sG_pathBadge",
-			"count": "i5o6sG_count",
-			"versionDiff": "i5o6sG_versionDiff",
-			"headerActions": "i5o6sG_headerActions",
-			"currentBadge": "i5o6sG_currentBadge",
-			"subtitle": "i5o6sG_subtitle",
-			"versionDot": "i5o6sG_versionDot",
-			"primaryButton": "i5o6sG_primaryButton",
-			"versionsPanel": "i5o6sG_versionsPanel",
-			"versionMain": "i5o6sG_versionMain",
-			"turnSection": "i5o6sG_turnSection",
-			"messageHeader": "i5o6sG_messageHeader",
-			"kindBadge": "i5o6sG_kindBadge",
-			"editor": "i5o6sG_editor",
-			"versionButton": "i5o6sG_versionButton",
-			"sectionHeading": "i5o6sG_sectionHeading",
-			"editorHint": "i5o6sG_editorHint",
-			"versionList": "i5o6sG_versionList",
-			"effectControls": "i5o6sG_effectControls",
-			"messageText": "i5o6sG_messageText"
+			"turnSection": "i1EzGq_turnSection",
+			"effectDepth": "i1EzGq_effectDepth",
+			"messageList": "i1EzGq_messageList",
+			"messageCard": "i1EzGq_messageCard",
+			"versionMeta": "i1EzGq_versionMeta",
+			"pathBadge": "i1EzGq_pathBadge",
+			"versionItem": "i1EzGq_versionItem",
+			"messageTime": "i1EzGq_messageTime",
+			"messageText": "i1EzGq_messageText",
+			"turnHeader": "i1EzGq_turnHeader",
+			"effectControls": "i1EzGq_effectControls",
+			"versionLine": "i1EzGq_versionLine",
+			"turnPreview": "i1EzGq_turnPreview",
+			"root": "i1EzGq_root",
+			"primaryButton": "i1EzGq_primaryButton",
+			"textButton": "i1EzGq_textButton",
+			"versionDot": "i1EzGq_versionDot",
+			"kindBadge": "i1EzGq_kindBadge",
+			"versionMain": "i1EzGq_versionMain",
+			"editor": "i1EzGq_editor",
+			"versionTitle": "i1EzGq_versionTitle",
+			"select": "i1EzGq_select",
+			"secondaryButton": "i1EzGq_secondaryButton",
+			"currentBadge": "i1EzGq_currentBadge",
+			"notice": "i1EzGq_notice",
+			"subtitle": "i1EzGq_subtitle",
+			"intro": "i1EzGq_intro",
+			"error": "i1EzGq_error",
+			"empty": "i1EzGq_empty",
+			"textarea": "i1EzGq_textarea",
+			"turnsPanel": "i1EzGq_turnsPanel",
+			"versionsPanel": "i1EzGq_versionsPanel",
+			"turnTitle": "i1EzGq_turnTitle",
+			"sectionHeading": "i1EzGq_sectionHeading",
+			"count": "i1EzGq_count",
+			"status": "i1EzGq_status",
+			"versionDiff": "i1EzGq_versionDiff",
+			"columns": "i1EzGq_columns",
+			"versionButton": "i1EzGq_versionButton",
+			"messageHeader": "i1EzGq_messageHeader",
+			"editorActions": "i1EzGq_editorActions",
+			"editorHint": "i1EzGq_editorHint",
+			"pageHeader": "i1EzGq_pageHeader",
+			"title": "i1EzGq_title",
+			"cascadeField": "i1EzGq_cascadeField",
+			"turnList": "i1EzGq_turnList",
+			"effectButtons": "i1EzGq_effectButtons",
+			"headerActions": "i1EzGq_headerActions",
+			"versionList": "i1EzGq_versionList"
 		};
 		//#endregion
 		//#region src/client/MessageEditTimelineView.tsx
@@ -1211,14 +1424,109 @@ window.__ModuleLoader__.load({
 		//#endregion
 		//#region src/client/index.ts
 		/** Explicit value sources and slot declaration-order edges. */
-		const inject = [
-			"slots",
-			"conversation",
-			"connection",
-			"sessions"
-		];
+		const inject = ["slots", "sessions"];
+		/** Locate one finalized assistant message event inside the loaded event window. */
+		function assistantEventIn(window, messageId) {
+			for (const entry of window.entries) {
+				if (entry.type !== "event") continue;
+				const event = entry.event;
+				if (event.type !== "assistant/message") continue;
+				if (event.data.message.id !== messageId) continue;
+				const text = event.data.message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+				if (text.length === 0) return void 0;
+				return { text };
+			}
+		}
+		function responseJson(response) {
+			return response.json().catch(() => null);
+		}
+		function errorText(value) {
+			const record = typeof value === "object" && value !== null ? value : {};
+			if (typeof record["error"] === "string") return record["error"];
+			return "操作失败，请稍后重试。";
+		}
+		/** Resolve once the Session list publishes the child id, then select it. */
+		function openWhenListed(sessions, sessionId) {
+			if (sessions.list.getSnapshot().byId[sessionId] !== void 0) {
+				sessions.open(sessionId);
+				return Promise.resolve();
+			}
+			return new Promise((resolve) => {
+				let settled = false;
+				let dispose = () => {};
+				const finish = (open) => {
+					if (settled) return;
+					settled = true;
+					dispose();
+					if (open) sessions.open(sessionId);
+					resolve();
+				};
+				dispose = sessions.list.subscribe(() => {
+					if (sessions.list.getSnapshot().byId[sessionId] === void 0) return;
+					finish(true);
+				});
+				if (sessions.list.getSnapshot().byId[sessionId] !== void 0) finish(true);
+			});
+		}
+		/** Per-session verbs backing every assistant bubble-edit entry. */
+		function assistantEditFace(sessions, sessionId) {
+			return {
+				async loadText(messageId) {
+					const window = sessions.binding(sessionId)?.eventSource.getSnapshot();
+					if (window === void 0) return {
+						ok: false,
+						error: "会话尚未就绪，请稍后重试。"
+					};
+					const found = assistantEventIn(window, messageId);
+					if (found === void 0) return {
+						ok: false,
+						error: "未找到该消息的完整原文（可能需要先加载更早的历史）。"
+					};
+					return {
+						ok: true,
+						text: found.text
+					};
+				},
+				async submit(messageId, text, cascade) {
+					try {
+						const response = await fetch(MESSAGE_EDIT_PATH, {
+							method: "POST",
+							headers: {
+								accept: "application/json",
+								"content-type": "application/json"
+							},
+							body: JSON.stringify({
+								action: "editMessage",
+								sessionId,
+								messageId,
+								text,
+								cascade
+							})
+						});
+						const value = await responseJson(response);
+						if (!response.ok) return {
+							ok: false,
+							error: errorText(value)
+						};
+						const childId = (typeof value === "object" && value !== null ? value : {})["sessionId"];
+						if (typeof childId !== "string" || childId.length === 0) return {
+							ok: false,
+							error: "宿主未返回新版本会话。"
+						};
+						await openWhenListed(sessions, childId);
+						return { ok: true };
+					} catch (error) {
+						return {
+							ok: false,
+							error: error instanceof Error ? error.message : "网络错误，操作未完成。"
+						};
+					}
+				}
+			};
+		}
 		/** Register both UI contributions over one per-session controller identity. */
 		function apply(ctx) {
+			const sessions = ctx.get("sessions");
 			const controllers = /* @__PURE__ */ new Map();
 			const controllerFor = (sessionId) => {
 				let controller = controllers.get(sessionId);
@@ -1228,22 +1536,37 @@ window.__ModuleLoader__.load({
 				}
 				return controller;
 			};
+			const editFaces = /* @__PURE__ */ new Map();
+			const faceFor = (sessionId) => {
+				let face = editFaces.get(sessionId);
+				if (face === void 0) {
+					face = assistantEditFace(sessions, sessionId);
+					editFaces.set(sessionId, face);
+				}
+				return face;
+			};
 			ctx.on("connection/reset", () => {
 				for (const controller of controllers.values()) controller.refreshIfLoaded();
 			});
-			ctx.slots.register({
+			ctx.slots.inject("conversation.chat.assistant-actions", () => ctx.slots.register({
+				name: "conversation.chat.assistant-actions",
+				id: "message-edit-assistant",
+				order: 20,
+				inject: (sessionId) => faceFor(sessionId)
+			}, AssistantMessageEdit));
+			ctx.slots.inject("conversation.view", () => ctx.slots.register({
 				name: "conversation.view",
 				id: "message-edit-timeline",
 				order: 15,
 				label: "Timeline",
 				inject: (sessionId) => controllerFor(sessionId).face
-			}, MessageEditTimelineView);
-			ctx.slots.register({
+			}, MessageEditTimelineView));
+			ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({
 				name: "conversation.session.header.actions",
 				id: "message-edit-controls",
 				order: 15,
 				inject: (sessionId) => controllerFor(sessionId).face
-			}, MessageEditHeader);
+			}, MessageEditHeader));
 		}
 		//#endregion
 		exports.apply = apply;

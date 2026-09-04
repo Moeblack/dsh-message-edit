@@ -1,7 +1,9 @@
 /** Host half of Message Edit: turn-atomic forks and structurally reversible versions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentOptions, AgentSetup } from '@deepseek-ai/dsh-agent'
-import type { PresetBearingSession } from '@deepseek-ai/dsh-agent-presets'
+// Type-only: pulls the agent-presets module (its SessionEventMap
+// 'agent-preset/selected' augmentation and Context 'agentPresets' service).
+import type {} from '@deepseek-ai/dsh-agent-presets'
 import type {
   SessionId,
   Session,
@@ -10,6 +12,7 @@ import type {
   SurfaceEventType,
   SurfaceIntent,
 } from '@deepseek-ai/dsh-session'
+import type { SessionLogOffset } from '@deepseek-ai/dsh-session/types'
 import type {
   SessionLineageNode,
   SessionRecord,
@@ -27,6 +30,7 @@ import {
   type EditOperation,
   type EditableBlockKind,
   type EditableMessageBlock,
+  type EditResponseOperation,
   type LegacyMessageEditVersionEvent,
   type MessageEditEffect,
   type MessageEditOperation,
@@ -47,6 +51,7 @@ export type {
   CascadePolicy,
   EditOperation,
   EditableBlockKind,
+  EditResponseOperation,
   EditableMessageBlock,
   MessageEditOperation,
   MessageEditOperationResult,
@@ -335,6 +340,79 @@ function editPlan(operation: EditOperation, turns: readonly ClosedTurn[]): Opera
   }
 }
 
+/** Full text of an assistant message's response (non-reasoning text blocks). */
+function responseText(message: AssistantMessage): string {
+  return message.content
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+}
+
+/** Replace every response text block with one new text block, preserving reasoning and other blocks. */
+function replaceResponseText(content: readonly ContentBlock[], text: string): ContentBlock[] {
+  const result: ContentBlock[] = []
+  let inserted = false
+  for (const block of content) {
+    if (block.type === 'text') {
+      if (!inserted) {
+        result.push({ type: 'text', text })
+        inserted = true
+      }
+      continue
+    }
+    result.push(structuredClone(block))
+  }
+  if (!inserted) result.push({ type: 'text', text })
+  return result
+}
+
+function editResponsePlan(operation: EditResponseOperation, events: readonly SessionEvent[]): OperationPlan {
+  const turns = closedTurns(events)
+  const target = events.find((event): event is SessionEvent<'assistant/message'> => (
+    event.type === 'assistant/message'
+    && event.data.message.id === operation.messageId
+  ))
+  if (target === undefined) throw new Error('所选助手消息不在本会话中或尚未落定。')
+  const turnIndex = turns.findIndex(turn => target.seq > turn.startSeq && target.seq < turn.endSeq)
+  const turn = turns[turnIndex]
+  if (turn === undefined) throw new Error('所选助手消息不属于已落定回合。')
+  if (turn.user === undefined) throw new Error('所选助手消息没有可重建的用户输入。')
+  const before = responseText(target.data.message)
+  if (before.length === 0) throw new Error('所选助手消息没有可编辑的回复文本。')
+  const replaced = replaceResponseText(target.data.message.content, operation.text)
+    .filter(block => block.type === 'text' || block.type === 'reasoning')
+  const assistant: AssistantMessage = Object.freeze({
+    id: crypto.randomUUID(),
+    role: 'assistant' as const,
+    content: Object.freeze(replaced),
+    source: Object.freeze({
+      kind: 'model' as const,
+      provider: target.data.message.source.provider,
+      model: target.data.message.source.model,
+    }),
+  }) as AssistantMessage
+  return {
+    boundary: turn.startSeq - 1,
+    version: pairVersionEffect(operation.sessionId, {
+      operation: 'edit',
+      cascade: operation.cascade,
+      targetTurn: turn.turn,
+      targetEventSeq: target.seq,
+      blockKind: 'assistant.response',
+      before,
+      after: operation.text,
+    }),
+    manualTurn: {
+      turn: turn.turn,
+      user: cloneUser(turn.user.data),
+      assistant,
+    },
+    queuedUsers: operation.cascade === 'preserve'
+      ? downstreamUsers(turns, turnIndex + 1)
+      : [],
+  }
+}
+
 function retryPlan(
   sessionId: string,
   turnNumber: number,
@@ -383,6 +461,8 @@ function planOperation(operation: MessageEditOperation, events: readonly Session
   switch (operation.action) {
     case 'edit':
       return editPlan(operation, turns)
+    case 'editMessage':
+      return editResponsePlan(operation, events)
     case 'reroll':
       return rerollPlan(operation.sessionId, turns)
     case 'retry':
@@ -429,11 +509,12 @@ async function withSourceAgent<T>(
 
 function inheritedSeed(source: Session, boundary: number): SessionEvent[] {
   if (boundary === -1) return []
-  const boundaryEvent = source.events[boundary]
+  const events = source.snapshotEvents()
+  const boundaryEvent = events[boundary]
   if (boundary < 0 || boundaryEvent === undefined || boundaryEvent.seq !== boundary) {
     throw new Error('分支边界不是连续会话事件。')
   }
-  return source.events.slice(0, boundary + 1)
+  return events.slice(0, boundary + 1)
 }
 
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
@@ -485,9 +566,10 @@ function versionSeed(source: Session, plan: OperationPlan): {
   return { events, inheritedLength }
 }
 
-function sessionPreset(session: PresetBearingSession): string | undefined {
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index]
+function sessionPreset(session: Session): string | undefined {
+  const events = session.snapshotEvents()
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
     if (event?.type === 'agent-preset/selected') return event.data.agentPreset
   }
   return session.header.agentPreset
@@ -516,9 +598,10 @@ async function createVersionAgent(
     meta: {
       ...source.header.cwd === undefined ? {} : { cwd: source.header.cwd },
       parentSession: source.id,
-      seedLength: seed.inheritedLength,
+      isSeeded: true,
       ...agentPreset === undefined ? {} : { agentPreset },
     },
+    inheritedEventCount: seed.inheritedLength as SessionLogOffset,
     agentOptions: options,
     ...setup === undefined ? {} : { setup },
   })
@@ -555,7 +638,7 @@ async function runOperation(ctx: Context, operation: MessageEditOperation): Prom
     const childId = sessionIdOf(`session-${crypto.randomUUID()}`)
     const inverses: OperationInverse[] = []
     try {
-      const events = source.session.events
+      const events = source.session.snapshotEvents()
       const plan = planOperation(operation, events)
       const options = agentOptions(events, source.options)
       const child = await createVersionAgent(ctx, source.session, childId, plan, options)
@@ -583,17 +666,16 @@ async function runOperation(ctx: Context, operation: MessageEditOperation): Prom
 
 function ownVersionEvent(
   header: SessionRecord['header'],
-  events: readonly SessionEvent[],
+  ownEvents: readonly SessionEvent[],
 ): VersionProjection | undefined {
-  const inherited = header.seedLength ?? 0
-  const ownEvents = events.filter((event): event is SessionEvent<'message-edit/version'> => (
-    event.type === 'message-edit/version' && event.seq >= inherited
+  const versions = ownEvents.filter((event): event is SessionEvent<'message-edit/version'> => (
+    event.type === 'message-edit/version'
   ))
-  if (ownEvents.length === 0) return undefined
-  if (ownEvents.length > 1) {
+  if (versions.length === 0) return undefined
+  if (versions.length > 1) {
     throw new Error(`会话 ${header.id} 包含多个自身版本效果。`)
   }
-  const event = ownEvents[0]
+  const event = versions[0]
   if (event === undefined) return undefined
   const parent = header.parentSession
   if ('schemaVersion' in event.data) {
@@ -649,14 +731,7 @@ function flattenLineage(
   return result
 }
 
-/** Minimal read face of the optional persistence service; borrowed events are
- * consumed synchronously inside one timeline projection. */
-interface PersistenceReaderLike {
-  inspect(sessionId: SessionId, signal?: AbortSignal): Promise<{ events: readonly SessionEvent[] }>
-  readFrom(sessionId: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ events: readonly SessionEvent[] }>
-}
-
-/** Bounded parallel inspection of persisted branches; matches the corpus worker shape. */
+/** Bounded parallel branch reads; matches the corpus worker shape. */
 const TIMELINE_READ_CONCURRENCY = 4
 
 async function mapConcurrent<T, R>(
@@ -678,24 +753,20 @@ async function mapConcurrent<T, R>(
   return results
 }
 
-/** Full log for the requested session: live borrow, persisted inspection, query fallback. */
-async function readCurrentLog(ctx: Context, sessionId: SessionId): Promise<readonly SessionEvent[]> {
-  const live = ctx.sessions.get(sessionId)
-  if (live !== undefined) return live.events
-  const persistence = ctx.get('sessionPersistence') as PersistenceReaderLike | undefined
-  if (persistence !== undefined) return (await persistence.inspect(sessionId)).events
-  return (await ctx.sessionQuery.readSession(sessionId)).events
+/** One session's full event log plus its fork-inherited prefix length. */
+interface SessionLogRead {
+  events: readonly SessionEvent[]
+  inherited: number
 }
 
-/** Own-version scan window for one lineage node: the tail from the durable
- * seed boundary is enough, and root nodes cannot carry a version effect. */
-async function versionLog(ctx: Context, record: SessionRecord): Promise<readonly SessionEvent[]> {
-  const inherited = record.header.seedLength ?? 0
-  const live = ctx.sessions.get(record.header.id)
-  if (live !== undefined) return live.events.slice(inherited)
-  const persistence = ctx.get('sessionPersistence') as PersistenceReaderLike | undefined
-  if (persistence !== undefined) return (await persistence.readFrom(record.header.id, inherited)).events
-  return (await ctx.sessionQuery.readSession(record.header.id)).events.slice(inherited)
+/** Full log for the requested session: live borrow, then query snapshot. */
+async function sessionLog(ctx: Context, sessionId: SessionId): Promise<SessionLogRead> {
+  const live = ctx.sessions.get(sessionId)
+  if (live !== undefined) {
+    return { events: live.snapshotEvents(), inherited: live.inheritedEventCount }
+  }
+  const snapshot = await ctx.sessionQuery.readSession(sessionId)
+  return { events: snapshot.events, inherited: snapshot.inheritedEventCount }
 }
 
 async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEditTimeline> {
@@ -706,9 +777,11 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
   const rootTrace = rootId === sessionId ? targetTrace : await ctx.sessionQuery.traceSession(rootId)
   const lineage = flattenLineage(rootTrace.target, rootTrace.descendants)
   const logs = await mapConcurrent(lineage, async ({ record }): Promise<readonly SessionEvent[]> => {
-    if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId)
-    if (record.header.parentSession === undefined) return []
-    return versionLog(ctx, record)
+    if (record.header.id === sessionId || record.header.parentSession !== undefined) {
+      const log = await sessionLog(ctx, record.header.id)
+      return log.inherited === 0 ? log.events : log.events.slice(log.inherited)
+    }
+    return []
   })
   const recordsById = new Map(lineage.map(({ record }) => [record.header.id, record]))
   const currentPath = new Set<SessionId>()
@@ -814,6 +887,18 @@ function decodeOperation(value: unknown): MessageEditOperation {
         text: record['text'],
         cascade: cascadeOf(record['cascade']),
       }
+    case 'editMessage':
+      if (typeof record['messageId'] !== 'string' || record['messageId'].length === 0) {
+        throw new TypeError('messageId 必须是非空字符串。')
+      }
+      if (typeof record['text'] !== 'string') throw new TypeError('text 必须是字符串。')
+      return {
+        action: 'editMessage',
+        sessionId,
+        messageId: record['messageId'],
+        text: record['text'],
+        cascade: cascadeOf(record['cascade']),
+      }
     case 'reroll':
       return { action: 'reroll', sessionId }
     case 'retry':
@@ -824,7 +909,7 @@ function decodeOperation(value: unknown): MessageEditOperation {
         cascade: cascadeOf(record['cascade']),
       }
     default:
-      throw new TypeError('action 必须是 edit、reroll 或 retry。')
+      throw new TypeError('action 必须是 edit、editMessage、reroll 或 retry。')
   }
 }
 

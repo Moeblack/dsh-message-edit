@@ -5,9 +5,17 @@ import { fileURLToPath } from 'node:url'
 
 const pluginRoot = fileURLToPath(new URL('..', import.meta.url))
 
+/** pnpm bin shims carry a .CMD suffix on Windows. */
+const bin = (name) => join(pluginRoot, 'node_modules/.bin', process.platform === 'win32' ? `${name}.CMD` : name)
+
 function run(command, args) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, { cwd: pluginRoot, stdio: 'inherit', env: process.env })
+    const child = spawn(command, args, {
+      cwd: pluginRoot,
+      stdio: 'inherit',
+      env: process.env,
+      shell: process.platform === 'win32',
+    })
     child.once('error', reject)
     child.once('exit', (code, signal) => {
       if (code === 0) {
@@ -21,8 +29,8 @@ function run(command, args) {
 
 const dist = join(pluginRoot, 'dist')
 await rm(dist, { recursive: true, force: true })
-await run(join(pluginRoot, 'node_modules/.bin/tsc'), ['-p', 'tsconfig.json'])
-await run(join(pluginRoot, 'node_modules/.bin/tsdown'), ['--config', 'tsdown.config.ts'])
+await run(bin('tsc'), ['-p', 'tsconfig.json'])
+await run(bin('tsdown'), ['--config', 'tsdown.config.ts'])
 await copyFile(join(dist, 'index.js'), join(pluginRoot, 'index.mjs'))
 await copyFile(join(dist, 'client.js'), join(pluginRoot, 'client.js'))
 await copyFile(join(dist, 'client.js.map'), join(pluginRoot, 'client.js.map'))

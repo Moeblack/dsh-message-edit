@@ -6,12 +6,15 @@
 
 `dsh-message-edit`（[npm](https://www.npmjs.com/package/dsh-message-edit) · [GitHub](https://github.com/Moeblack/dsh-message-edit)）为 DeepSeek Harness 补充基于事件溯源的「消息编辑与重生成」能力。插件不改写历史事件，也不修改 DSH 引擎内部；每次编辑、重生成或重试都会从目标回合之前创建一个新会话版本，原会话始终保留并可随时切回。
 
+> **兼容性**：v0.3.0 起适配 `dsh` 0.1.2 系列（npm `0.1.2-rc.1` 及同代源码构建，官方已移除 `dsh-client-runtime` 的版本）。`0.1.0-rc.6` 及更早的宿主不再支持；旧版插件（v0.2.x）仅适用于带 `dsh-client-runtime` 的旧宿主。
+
 ```bash
 dsh plugin --profile web add dsh-message-edit
 ```
 
 ## 功能
 
+- **气泡级编辑助手回复**（对话视图）：每条已落定 AI 回复的图标动作行提供 ✎ 编辑入口，弹出式编辑框预填该回复完整正文；保存后思考链保留、回复正文整体改写，从该回合边界生成新版本会话并自动打开。后续策略可选「截断后续 / 保留输入并重放后续」。
 - **编辑消息**：可编辑已落定的用户文本、`assistant.reasoning` 思考块与 `assistant.response` 回复文本。
 - **重生成**：从最后一条已落定助手回复所属回合之前分支，使用原用户输入重新生成。
 - **重试任意回合**：在 Timeline 中选择任意历史回合重新执行。
@@ -86,6 +89,9 @@ interface MessageEditVersionEvent {
 - `conversation.session.header.actions`
   - `id: message-edit-controls`
   - 直接父效果撤销、直接子效果重施加、效果链计数、最后回复重生成
+- `conversation.chat.assistant-actions`
+  - `id: message-edit-assistant`
+  - 每条已定稿 AI 消息图标动作行的回复编辑入口（✎），弹出编辑器改写整条回复正文（保留思考链）
 
 组件使用 CSS Modules 与 `--dsw-*` 语义 token，不引入 UI 库。所有产品文案为中文，代码注释为英文。
 
@@ -96,7 +102,7 @@ npm install
 npm run build
 ```
 
-构建基于 npm 发布的 `@deepseek-ai/*@0.1.0-rc.6` 类型与本地工具链（typescript、tsdown、lightningcss），不再依赖 dsh 源码树。构建生成：
+构建基于 npm 发布的 `@deepseek-ai/*@0.1.2-rc.1` 类型与本地工具链（typescript、tsdown、lightningcss），不再依赖 dsh 源码树。构建生成：
 
 - `index.mjs`：Host 插件
 - `client.js`：Browser 插件
@@ -119,7 +125,7 @@ dsh plugin --profile web add -w link:/path/to/dsh-message-edit
 ## HTTP 接口
 
 - `GET /message-edit?sessionId=<id>`：读取可编辑消息、可重试回合与完整版本树。
-- `POST /message-edit`：执行 `edit`、`reroll` 或 `retry`，返回已发布的新 Session ID。
+- `POST /message-edit`：执行 `edit`、`editMessage`（气泡级整条回复改写，按 `messageId` 定位）、`reroll` 或 `retry`，返回已发布的新 Session ID。
 
 ## 范围边界
 

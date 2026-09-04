@@ -189,6 +189,73 @@ function editPlan(operation, turns) {
 		queuedUsers: operation.cascade === "preserve" ? downstreamUsers(turns, turnIndex + 1) : []
 	};
 }
+/** Full text of an assistant message's response (non-reasoning text blocks). */
+function responseText(message) {
+	return message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+}
+/** Replace every response text block with one new text block, preserving reasoning and other blocks. */
+function replaceResponseText(content, text) {
+	const result = [];
+	let inserted = false;
+	for (const block of content) {
+		if (block.type === "text") {
+			if (!inserted) {
+				result.push({
+					type: "text",
+					text
+				});
+				inserted = true;
+			}
+			continue;
+		}
+		result.push(structuredClone(block));
+	}
+	if (!inserted) result.push({
+		type: "text",
+		text
+	});
+	return result;
+}
+function editResponsePlan(operation, events) {
+	const turns = closedTurns(events);
+	const target = events.find((event) => event.type === "assistant/message" && event.data.message.id === operation.messageId);
+	if (target === void 0) throw new Error("所选助手消息不在本会话中或尚未落定。");
+	const turnIndex = turns.findIndex((turn) => target.seq > turn.startSeq && target.seq < turn.endSeq);
+	const turn = turns[turnIndex];
+	if (turn === void 0) throw new Error("所选助手消息不属于已落定回合。");
+	if (turn.user === void 0) throw new Error("所选助手消息没有可重建的用户输入。");
+	const before = responseText(target.data.message);
+	if (before.length === 0) throw new Error("所选助手消息没有可编辑的回复文本。");
+	const replaced = replaceResponseText(target.data.message.content, operation.text).filter((block) => block.type === "text" || block.type === "reasoning");
+	const assistant = Object.freeze({
+		id: crypto.randomUUID(),
+		role: "assistant",
+		content: Object.freeze(replaced),
+		source: Object.freeze({
+			kind: "model",
+			provider: target.data.message.source.provider,
+			model: target.data.message.source.model
+		})
+	});
+	return {
+		boundary: turn.startSeq - 1,
+		version: pairVersionEffect(operation.sessionId, {
+			operation: "edit",
+			cascade: operation.cascade,
+			targetTurn: turn.turn,
+			targetEventSeq: target.seq,
+			blockKind: "assistant.response",
+			before,
+			after: operation.text
+		}),
+		manualTurn: {
+			turn: turn.turn,
+			user: cloneUser(turn.user.data),
+			assistant
+		},
+		queuedUsers: operation.cascade === "preserve" ? downstreamUsers(turns, turnIndex + 1) : []
+	};
+}
 function retryPlan(sessionId, turnNumber, cascade, turns) {
 	const turnIndex = turns.findIndex((turn) => turn.turn === turnNumber);
 	const turn = turns[turnIndex];
@@ -227,6 +294,7 @@ function planOperation(operation, events) {
 	const turns = closedTurns(events);
 	switch (operation.action) {
 		case "edit": return editPlan(operation, turns);
+		case "editMessage": return editResponsePlan(operation, events);
 		case "reroll": return rerollPlan(operation.sessionId, turns);
 		case "retry": return retryPlan(operation.sessionId, operation.turn, operation.cascade, turns);
 	}
@@ -262,9 +330,10 @@ async function withSourceAgent(ctx, sessionId, operation) {
 }
 function inheritedSeed(source, boundary) {
 	if (boundary === -1) return [];
-	const boundaryEvent = source.events[boundary];
+	const events = source.snapshotEvents();
+	const boundaryEvent = events[boundary];
 	if (boundary < 0 || boundaryEvent === void 0 || boundaryEvent.seq !== boundary) throw new Error("分支边界不是连续会话事件。");
-	return source.events.slice(0, boundary + 1);
+	return events.slice(0, boundary + 1);
 }
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
 function appendLogSeedEvent(events, type, data) {
@@ -321,8 +390,9 @@ function versionSeed(source, plan) {
 	};
 }
 function sessionPreset(session) {
-	for (let index = session.events.length - 1; index >= 0; index -= 1) {
-		const event = session.events[index];
+	const events = session.snapshotEvents();
+	for (let index = events.length - 1; index >= 0; index -= 1) {
+		const event = events[index];
 		if (event?.type === "agent-preset/selected") return event.data.agentPreset;
 	}
 	return session.header.agentPreset;
@@ -346,9 +416,10 @@ async function createVersionAgent(ctx, source, childId, plan, options) {
 		meta: {
 			...source.header.cwd === void 0 ? {} : { cwd: source.header.cwd },
 			parentSession: source.id,
-			seedLength: seed.inheritedLength,
+			isSeeded: true,
 			...agentPreset === void 0 ? {} : { agentPreset }
 		},
+		inheritedEventCount: seed.inheritedLength,
 		agentOptions: options,
 		...setup === void 0 ? {} : { setup }
 	});
@@ -378,7 +449,7 @@ async function runOperation(ctx, operation) {
 		const childId = sessionIdOf(`session-${crypto.randomUUID()}`);
 		const inverses = [];
 		try {
-			const events = source.session.events;
+			const events = source.session.snapshotEvents();
 			const plan = planOperation(operation, events);
 			const options = agentOptions(events, source.options);
 			const child = await createVersionAgent(ctx, source.session, childId, plan, options);
@@ -404,12 +475,11 @@ async function runOperation(ctx, operation) {
 		}
 	});
 }
-function ownVersionEvent(header, events) {
-	const inherited = header.seedLength ?? 0;
-	const ownEvents = events.filter((event) => event.type === "message-edit/version" && event.seq >= inherited);
-	if (ownEvents.length === 0) return void 0;
-	if (ownEvents.length > 1) throw new Error(`会话 ${header.id} 包含多个自身版本效果。`);
-	const event = ownEvents[0];
+function ownVersionEvent(header, ownEvents) {
+	const versions = ownEvents.filter((event) => event.type === "message-edit/version");
+	if (versions.length === 0) return void 0;
+	if (versions.length > 1) throw new Error(`会话 ${header.id} 包含多个自身版本效果。`);
+	const event = versions[0];
 	if (event === void 0) return void 0;
 	const parent = header.parentSession;
 	if ("schemaVersion" in event.data) {
@@ -458,7 +528,7 @@ function flattenLineage(root, descendants) {
 	visit(descendants, 1);
 	return result;
 }
-/** Bounded parallel inspection of persisted branches; matches the corpus worker shape. */
+/** Bounded parallel branch reads; matches the corpus worker shape. */
 const TIMELINE_READ_CONCURRENCY = 4;
 async function mapConcurrent(items, worker) {
 	const results = new Array(items.length);
@@ -475,23 +545,18 @@ async function mapConcurrent(items, worker) {
 	await Promise.all(Array.from({ length: workers }, () => run()));
 	return results;
 }
-/** Full log for the requested session: live borrow, persisted inspection, query fallback. */
-async function readCurrentLog(ctx, sessionId) {
+/** Full log for the requested session: live borrow, then query snapshot. */
+async function sessionLog(ctx, sessionId) {
 	const live = ctx.sessions.get(sessionId);
-	if (live !== void 0) return live.events;
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.inspect(sessionId)).events;
-	return (await ctx.sessionQuery.readSession(sessionId)).events;
-}
-/** Own-version scan window for one lineage node: the tail from the durable
-* seed boundary is enough, and root nodes cannot carry a version effect. */
-async function versionLog(ctx, record) {
-	const inherited = record.header.seedLength ?? 0;
-	const live = ctx.sessions.get(record.header.id);
-	if (live !== void 0) return live.events.slice(inherited);
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.readFrom(record.header.id, inherited)).events;
-	return (await ctx.sessionQuery.readSession(record.header.id)).events.slice(inherited);
+	if (live !== void 0) return {
+		events: live.snapshotEvents(),
+		inherited: live.inheritedEventCount
+	};
+	const snapshot = await ctx.sessionQuery.readSession(sessionId);
+	return {
+		events: snapshot.events,
+		inherited: snapshot.inheritedEventCount
+	};
 }
 async function timeline(ctx, sessionId) {
 	const targetTrace = await ctx.sessionQuery.traceSession(sessionId);
@@ -499,9 +564,11 @@ async function timeline(ctx, sessionId) {
 	const rootTrace = rootId === sessionId ? targetTrace : await ctx.sessionQuery.traceSession(rootId);
 	const lineage = flattenLineage(rootTrace.target, rootTrace.descendants);
 	const logs = await mapConcurrent(lineage, async ({ record }) => {
-		if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId);
-		if (record.header.parentSession === void 0) return [];
-		return versionLog(ctx, record);
+		if (record.header.id === sessionId || record.header.parentSession !== void 0) {
+			const log = await sessionLog(ctx, record.header.id);
+			return log.inherited === 0 ? log.events : log.events.slice(log.inherited);
+		}
+		return [];
 	});
 	const recordsById = new Map(lineage.map(({ record }) => [record.header.id, record]));
 	const currentPath = /* @__PURE__ */ new Set();
@@ -593,6 +660,16 @@ function decodeOperation(value) {
 				text: record["text"],
 				cascade: cascadeOf(record["cascade"])
 			};
+		case "editMessage":
+			if (typeof record["messageId"] !== "string" || record["messageId"].length === 0) throw new TypeError("messageId 必须是非空字符串。");
+			if (typeof record["text"] !== "string") throw new TypeError("text 必须是字符串。");
+			return {
+				action: "editMessage",
+				sessionId,
+				messageId: record["messageId"],
+				text: record["text"],
+				cascade: cascadeOf(record["cascade"])
+			};
 		case "reroll": return {
 			action: "reroll",
 			sessionId
@@ -603,7 +680,7 @@ function decodeOperation(value) {
 			turn: integerOf(record["turn"], "turn"),
 			cascade: cascadeOf(record["cascade"])
 		};
-		default: throw new TypeError("action 必须是 edit、reroll 或 retry。");
+		default: throw new TypeError("action 必须是 edit、editMessage、reroll 或 retry。");
 	}
 }
 function requestJson(request) {

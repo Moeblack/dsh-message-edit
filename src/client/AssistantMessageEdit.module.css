@@ -1,0 +1,116 @@
+.action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-text-secondary, #7a7a85);
+  cursor: pointer;
+}
+.action:hover {
+  background: var(--dsw-hover, rgba(128, 128, 145, 0.12));
+  color: var(--dsw-text-primary, #2a2a33);
+}
+
+.panel {
+  position: fixed;
+  z-index: 60;
+  width: min(560px, calc(100vw - 24px));
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--dsw-surface, #ffffff);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+  border: 1px solid var(--dsw-border, rgba(128, 128, 145, 0.24));
+  color: var(--dsw-text-primary, #2a2a33);
+}
+
+.panelTitle {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.input {
+  width: 100%;
+  min-height: 120px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-border, rgba(128, 128, 145, 0.3));
+  border-radius: 8px;
+  background: var(--dsw-input, rgba(128, 128, 145, 0.06));
+  color: var(--dsw-text-primary, #2a2a33);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+  box-sizing: border-box;
+  outline: none;
+}
+.input:focus {
+  border-color: var(--dsw-accent, #4b6bfb);
+}
+
+.policy {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.policy button {
+  flex: 1;
+  padding: 5px 8px;
+  border: 1px solid var(--dsw-border, rgba(128, 128, 145, 0.3));
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-text-secondary, #6a6a76);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.policyActive {
+  border-color: var(--dsw-accent, #4b6bfb) !important;
+  color: var(--dsw-accent, #4b6bfb) !important;
+  background: var(--dsw-accent-soft, rgba(75, 107, 251, 0.08)) !important;
+}
+
+.hint {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dsw-text-tertiary, #9a9aa6);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+.actions button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.save {
+  background: var(--dsw-accent, #4b6bfb);
+  color: #ffffff;
+}
+.save:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.cancel {
+  background: var(--dsw-hover, rgba(128, 128, 145, 0.12));
+  color: var(--dsw-text-primary, #2a2a33);
+}
+
+.failure {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #d64545;
+}
