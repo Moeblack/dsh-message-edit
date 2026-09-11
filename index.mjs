@@ -365,7 +365,8 @@ function appendManualTurn(events, manual) {
 	appendSurfaceSeedEvent(events, "assistant/message", {
 		turn,
 		step: 1,
-		message: assistant
+		message: assistant,
+		stream: []
 	}, {
 		surfaceOp: "append",
 		sourceEventSeqs: []

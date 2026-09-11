@@ -6,7 +6,7 @@
 
 `dsh-message-edit`（[npm](https://www.npmjs.com/package/dsh-message-edit) · [GitHub](https://github.com/Moeblack/dsh-message-edit)）为 DeepSeek Harness 补充基于事件溯源的「消息编辑与重生成」能力。插件不改写历史事件，也不修改 DSH 引擎内部；每次编辑、重生成或重试都会从目标回合之前创建一个新会话版本，原会话始终保留并可随时切回。
 
-> **兼容性**：v0.3.0 起适配 `dsh` 0.1.2 系列（npm `0.1.2-rc.1` 及同代源码构建，官方已移除 `dsh-client-runtime` 的版本）。`0.1.0-rc.6` 及更早的宿主不再支持；旧版插件（v0.2.x）仅适用于带 `dsh-client-runtime` 的旧宿主。
+> **兼容性**：v0.3.1 起适配 `dsh` 0.1.5 系列（npm `0.1.5-rc.2` 及同代源码构建）。`dsh` 0.1.2 系列请使用 v0.3.0；`0.1.0-rc.6` 及更早的宿主不再支持（v0.2.x 插件仅适用于带 `dsh-client-runtime` 的旧宿主）。
 
 ```bash
 dsh plugin --profile web add dsh-message-edit

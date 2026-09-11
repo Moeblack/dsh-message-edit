@@ -539,7 +539,7 @@ function appendSurfaceSeedEvent<T extends SurfaceEventType>(
     data,
     surfaceOp: intent.surfaceOp,
     ...intent.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: intent.sourceEventSeqs },
-  } as SessionEvent<T>)
+  } as unknown as SessionEvent<T>)
 }
 
 function appendManualTurn(events: SessionEvent[], manual: ManualAssistantTurn): void {
@@ -547,7 +547,7 @@ function appendManualTurn(events: SessionEvent[], manual: ManualAssistantTurn): 
   appendLogSeedEvent(events, 'turn/start', { turn })
   appendSurfaceSeedEvent(events, 'user/message', user, { surfaceOp: 'append' })
   appendLogSeedEvent(events, 'step/start', { turn, step: 1 })
-  appendSurfaceSeedEvent(events, 'assistant/message', { turn, step: 1, message: assistant }, {
+  appendSurfaceSeedEvent(events, 'assistant/message', { turn, step: 1, message: assistant, stream: [] }, {
     surfaceOp: 'append',
     sourceEventSeqs: [],
   })
