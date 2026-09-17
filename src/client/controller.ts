@@ -1,15 +1,16 @@
 /** Browser controller for one session's Timeline projection and branch mutations. */
+import type { Context } from '@deepseek-ai/cordis'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type {
-  ClientContext,
-  ConversationSnapshot,
   ISessions,
-  ObservableSnapshot,
-  SessionFace,
-  SessionId,
+  SessionEventSource,
   SessionListState,
-  SnapshotStore,
-} from '@deepseek-ai/dsh-client-runtime/client'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+} from '@deepseek-ai/dsh-api-session-controller/client'
+import {
+  createSnapshotStore,
+  type ObservableSnapshot,
+  type SnapshotStore,
+} from '@deepseek-ai/dsh-client-store'
 import {
   MESSAGE_EDIT_PATH,
   type CascadePolicy,
@@ -27,7 +28,8 @@ import {
 export interface MessageEditState {
   status: 'idle' | 'loading' | 'ready' | 'error'
   error: string | null
-  pending: VersionOperation | null
+  /** In-flight mutation discriminator; display code only tests nullability. */
+  pending: string | null
   timeline: MessageEditTimeline | null
 }
 
@@ -175,11 +177,8 @@ async function responseValue(response: Response): Promise<unknown> {
   throw new Error(typeof error === 'string' ? error : `请求失败：HTTP ${String(response.status)}`)
 }
 
-function conversationRevision(snapshot: ConversationSnapshot): string {
-  const turnEnds = [...snapshot.turnEnds.entries()]
-    .map(([turn, seq]) => `${String(turn)}:${String(seq)}`)
-    .join(',')
-  return [snapshot.openState, snapshot.removed, snapshot.hasMore, turnEnds].join('|')
+function eventRevision(source: SessionEventSource): string {
+  return String(source.getSnapshot().revision)
 }
 
 function lineageRevision(snapshot: SessionListState, sessionId: SessionId): string {
@@ -220,9 +219,9 @@ export class MessageEditController {
 
   readonly face: MessageEditFace
   private generation = 0
-  private readonly ctx: ClientContext
+  private readonly ctx: Context
   private readonly sessions: ISessions
-  private sessionSource: SessionFace | undefined
+  private sessionSource: SessionEventSource | undefined
   private sessionSourceDispose: (() => void) | undefined
   private sessionRevision: string | undefined
   private listRevision = ''
@@ -238,7 +237,7 @@ export class MessageEditController {
   private users = 0
 
   constructor(
-    ctx: ClientContext,
+    ctx: Context,
     private readonly sessionId: SessionId,
   ) {
     this.ctx = ctx
@@ -332,14 +331,14 @@ export class MessageEditController {
   }
 
   private bindSessionSource(): boolean {
-    const source = this.sessions.binding(this.sessionId)?.session
+    const source = this.sessions.binding(this.sessionId)?.eventSource
     if (source === this.sessionSource) return false
     this.sessionSourceDispose?.()
     this.sessionSource = source
-    this.sessionRevision = source === undefined ? undefined : conversationRevision(source.getSnapshot())
+    this.sessionRevision = source === undefined ? undefined : eventRevision(source)
     this.sessionSourceDispose = source?.subscribe(() => {
       if (this.sessionSource !== source) return
-      const revision = conversationRevision(source.getSnapshot())
+      const revision = eventRevision(source)
       if (revision === this.sessionRevision) return
       this.sessionRevision = revision
       this.invalidate()

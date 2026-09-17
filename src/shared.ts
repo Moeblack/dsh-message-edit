@@ -117,6 +117,20 @@ export interface EditOperation {
   cascade: CascadePolicy
 }
 
+/**
+ * Rewrite the full response text of one finalized assistant message
+ * (bubble-level edit): every response text block is replaced by the new
+ * text; reasoning blocks are preserved; the turn is replayed from its
+ * boundary as a manually seeded assistant turn.
+ */
+export interface EditResponseOperation {
+  action: 'editMessage'
+  sessionId: string
+  messageId: string
+  text: string
+  cascade: CascadePolicy
+}
+
 /** Regenerate the latest completed assistant reply. */
 export interface RerollOperation {
   action: 'reroll'
@@ -132,7 +146,7 @@ export interface RetryOperation {
 }
 
 /** Mutation accepted by the host route. */
-export type MessageEditOperation = EditOperation | RerollOperation | RetryOperation
+export type MessageEditOperation = EditOperation | EditResponseOperation | RerollOperation | RetryOperation
 
 /** Host acknowledgement after the child Agent has been published and queued. */
 export interface MessageEditOperationResult {
