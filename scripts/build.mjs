@@ -2,6 +2,8 @@ import { copyFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
+const require = createRequire(import.meta.url)
 
 const pluginRoot = fileURLToPath(new URL('..', import.meta.url))
 
@@ -21,8 +23,9 @@ function run(command, args) {
 
 const dist = join(pluginRoot, 'dist')
 await rm(dist, { recursive: true, force: true })
-await run(join(pluginRoot, 'node_modules/.bin/tsc'), ['-p', 'tsconfig.json'])
-await run(join(pluginRoot, 'node_modules/.bin/tsdown'), ['--config', 'tsdown.config.ts'])
+await run(process.execPath, [require.resolve('typescript/bin/tsc'), '-p', 'tsconfig.host.json'])
+await run(process.execPath, [require.resolve('typescript/bin/tsc'), '-p', 'tsconfig.client.json'])
+await run(process.execPath, [require.resolve('tsdown/run'), '--config', 'tsdown.config.ts'])
 await copyFile(join(dist, 'index.js'), join(pluginRoot, 'index.mjs'))
 await copyFile(join(dist, 'client.js'), join(pluginRoot, 'client.js'))
 await copyFile(join(dist, 'client.js.map'), join(pluginRoot, 'client.js.map'))

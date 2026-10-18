@@ -1,3 +1,6 @@
 .dsh/
 dist/
 node_modules/
+tsconfig.local.*.json
+*.tsbuildinfo
+.DS_Store

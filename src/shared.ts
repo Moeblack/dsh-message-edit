@@ -1,5 +1,5 @@
 /** Same-origin endpoint owned by the Message Edit host plugin. */
-export const MESSAGE_EDIT_PATH = '/message-edit'
+export const MESSAGE_EDIT_PATH = '/api/message-edit'
 
 /** Timeline sits between Trajectory (10) and Prompt Studio (20). */
 export const MESSAGE_EDIT_VIEW_ORDER = 15
@@ -15,6 +15,13 @@ export type EditableBlockKind = 'user' | 'assistant.reasoning' | 'assistant.resp
 
 /** Current durable event schema for structurally paired version effects. */
 export const MESSAGE_EDIT_VERSION_SCHEMA = 2
+
+/**
+ * Durable plugin-record type owned by this plugin. The record stays outside
+ * `SessionEventMap` and carries `ignorable: true`, so readers that do not know
+ * it skip the record instead of refusing the session.
+ */
+export const MESSAGE_EDIT_RECORD_TYPE = 'plugin:message-edit/version' as const
 
 /** Forward half of one atomic version effect. */
 export interface MessageEditEffect {
@@ -60,6 +67,8 @@ export type StoredMessageEditVersionEvent = MessageEditVersionEvent | LegacyMess
 
 /** One text-bearing block that the Timeline editor can replace. */
 export interface EditableMessageBlock {
+  /** Exact current DSH Chat node identity; avoids matching rendered prose. */
+  chatNodeKey: string
   key: string
   turn: number
   eventSeq: number

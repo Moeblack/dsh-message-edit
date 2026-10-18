@@ -1,10 +1,18 @@
+import { SESSION_FORMAT_VERSION, Session, SessionLogOffset, SessionSeq } from "@deepseek-ai/dsh-session";
+import { createAssistantMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 //#region src/shared.ts
 /** Same-origin endpoint owned by the Message Edit host plugin. */
-const MESSAGE_EDIT_PATH = "/message-edit";
+const MESSAGE_EDIT_PATH = "/api/message-edit";
 /** Timeline sits between Trajectory (10) and Prompt Studio (20). */
 const MESSAGE_EDIT_VIEW_ORDER = 15;
 /** Current durable event schema for structurally paired version effects. */
 const MESSAGE_EDIT_VERSION_SCHEMA = 2;
+/**
+* Durable plugin-record type owned by this plugin. The record stays outside
+* `SessionEventMap` and carries `ignorable: true`, so readers that do not know
+* it skip the record instead of refusing the session.
+*/
+const MESSAGE_EDIT_RECORD_TYPE = "plugin:message-edit/version";
 //#endregion
 //#region src/index.ts
 /** Stable Cordis plugin name. */
@@ -16,7 +24,7 @@ const inject = [
 	"sessionPersistence",
 	"sessionQuery",
 	"workspaceRegistry",
-	"webServer"
+	"connection"
 ];
 function pairVersionEffect(sourceSessionId, effect) {
 	return {
@@ -38,11 +46,9 @@ function userText(message) {
 	return message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
 }
 function cloneUser(message, content = structuredClone(message.content)) {
-	return Object.freeze({
-		id: crypto.randomUUID(),
-		role: "user",
-		content: Object.freeze(content),
-		source: Object.freeze({ kind: "user" })
+	return createUserMessage({
+		content,
+		source: { kind: "user" }
 	});
 }
 function replaceTextBlock(content, blockIndex, text) {
@@ -92,6 +98,7 @@ function editableMessages(turns) {
 			if (block.type !== "text") continue;
 			result.push({
 				key: `${String(turn.user.seq)}:${String(blockIndex)}`,
+				chatNodeKey: `13:input-message${turn.user.data.id}`,
 				turn: turn.turn,
 				eventSeq: turn.user.seq,
 				blockIndex,
@@ -104,6 +111,7 @@ function editableMessages(turns) {
 			if (!isTextualBlock(block)) continue;
 			result.push({
 				key: `${String(event.seq)}:${String(blockIndex)}`,
+				chatNodeKey: `14:assistant-step${event.data.turn}:${event.data.step}`,
 				turn: turn.turn,
 				eventSeq: event.seq,
 				blockIndex,
@@ -127,16 +135,12 @@ function downstreamUsers(turns, start) {
 	return turns.slice(start).flatMap((turn) => turn.user === void 0 ? [] : [cloneUser(turn.user.data)]);
 }
 function assistantReplacement(event, blockIndex, text) {
-	const replaced = replaceTextBlock(event.data.message.content, blockIndex, text).filter((block) => block.type === "text" || block.type === "reasoning");
-	return Object.freeze({
-		id: crypto.randomUUID(),
-		role: "assistant",
-		content: Object.freeze(replaced),
-		source: Object.freeze({
-			kind: "model",
+	return createAssistantMessage({
+		content: replaceTextBlock(event.data.message.content, blockIndex, text).filter((block) => block.type === "text" || block.type === "reasoning"),
+		source: {
 			provider: event.data.message.source.provider,
 			model: event.data.message.source.model
-		})
+		}
 	});
 }
 function editPlan(operation, turns) {
@@ -237,10 +241,12 @@ function agentOptions(events, fallback) {
 	const model = config?.model ?? fallback?.model;
 	if (provider === void 0 || provider.length === 0 || model === void 0 || model.length === 0) throw new Error("无法从会话历史解析模型路由。");
 	const maxTokens = config?.maxTokens ?? fallback?.maxTokens;
+	const reasoningEffort = config === void 0 ? fallback?.reasoningEffort : config.reasoningEffort;
 	return {
 		provider,
 		model,
-		...maxTokens === void 0 ? {} : { maxTokens }
+		...maxTokens === void 0 ? {} : { maxTokens },
+		...reasoningEffort === void 0 ? {} : { reasoningEffort }
 	};
 }
 async function withSourceAgent(ctx, sessionId, operation) {
@@ -262,30 +268,42 @@ async function withSourceAgent(ctx, sessionId, operation) {
 }
 function inheritedSeed(source, boundary) {
 	if (boundary === -1) return [];
-	const boundaryEvent = source.events[boundary];
+	const boundaryEvent = source.eventAt(SessionSeq(boundary));
 	if (boundary < 0 || boundaryEvent === void 0 || boundaryEvent.seq !== boundary) throw new Error("分支边界不是连续会话事件。");
-	return source.events.slice(0, boundary + 1);
+	return [...source.snapshotEvents(SessionLogOffset(0), SessionLogOffset(boundary + 1))];
 }
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
 function appendLogSeedEvent(events, type, data) {
 	events.push({
 		type,
-		seq: events.length,
+		seq: SessionSeq(events.length),
 		time: Date.now(),
 		data
 	});
 }
+/** Append this plugin's ignorable v4 record at the child-owned boundary. */
+function appendVersionRecord(events, version) {
+	const record = {
+		type: MESSAGE_EDIT_RECORD_TYPE,
+		seq: SessionSeq(events.length),
+		time: Date.now(),
+		data: version,
+		ignorable: true
+	};
+	events.push(record);
+}
 function appendSurfaceSeedEvent(events, type, data, intent) {
-	events.push({
+	const envelope = {
 		type,
-		seq: events.length,
+		seq: SessionSeq(events.length),
 		time: Date.now(),
 		data,
 		surfaceOp: intent.surfaceOp,
 		...intent.sourceEventSeqs === void 0 ? {} : { sourceEventSeqs: intent.sourceEventSeqs }
-	});
+	};
+	events.push(envelope);
 }
-function appendManualTurn(events, manual) {
+function appendManualTurn(events, manual, options) {
 	const { turn, user, assistant } = manual;
 	appendLogSeedEvent(events, "turn/start", { turn });
 	appendSurfaceSeedEvent(events, "user/message", user, { surfaceOp: "append" });
@@ -293,14 +311,21 @@ function appendManualTurn(events, manual) {
 		turn,
 		step: 1
 	});
+	appendLogSeedEvent(events, "request/header", {
+		reason: "resume",
+		header: { config: {
+			provider: options.provider,
+			model: options.model,
+			...options.maxTokens === void 0 ? {} : { maxTokens: options.maxTokens },
+			...options.reasoningEffort === void 0 ? {} : { reasoningEffort: options.reasoningEffort }
+		} }
+	});
 	appendSurfaceSeedEvent(events, "assistant/message", {
 		turn,
 		step: 1,
-		message: assistant
-	}, {
-		surfaceOp: "append",
-		sourceEventSeqs: []
-	});
+		message: assistant,
+		stream: []
+	}, { surfaceOp: "append" });
 	appendLogSeedEvent(events, "step/end", {
 		turn,
 		step: 1
@@ -310,54 +335,64 @@ function appendManualTurn(events, manual) {
 		reason: { kind: "completed" }
 	});
 }
-function versionSeed(source, plan) {
-	const events = inheritedSeed(source, plan.boundary);
-	const inheritedLength = events.length;
-	appendLogSeedEvent(events, "message-edit/version", plan.version);
-	if (plan.manualTurn !== void 0) appendManualTurn(events, plan.manualTurn);
-	return {
-		events,
-		inheritedLength
-	};
-}
 function sessionPreset(session) {
-	for (let index = session.events.length - 1; index >= 0; index -= 1) {
-		const event = session.events[index];
+	const events = session.snapshotEvents();
+	for (let index = events.length - 1; index >= 0; index -= 1) {
+		const event = events[index];
 		if (event?.type === "agent-preset/selected") return event.data.agentPreset;
 	}
 	return session.header.agentPreset;
 }
 async function createVersionAgent(ctx, source, childId, plan, options) {
-	const seed = versionSeed(source, plan);
 	const presets = ctx.get("agentPresets");
 	const presetId = sessionPreset(source);
 	let agentPreset;
-	let setup;
-	if (presets !== void 0 && presetId !== void 0) {
-		const resolved = (await presets.resolve(presetId)).id;
-		agentPreset = resolved;
-		setup = async (agentCtx) => {
-			await presets.mount(agentCtx, resolved);
-		};
-	}
-	const child = await ctx.agents.create({
-		sessionId: childId,
-		seed: seed.events,
-		meta: {
-			...source.header.cwd === void 0 ? {} : { cwd: source.header.cwd },
-			parentSession: source.id,
-			seedLength: seed.inheritedLength,
-			...agentPreset === void 0 ? {} : { agentPreset }
-		},
-		agentOptions: options,
-		...setup === void 0 ? {} : { setup }
-	});
+	const setup = async (agentCtx, agent) => {
+		agent.inbox.clear();
+		if (presets !== void 0 && agentPreset !== void 0) await presets.mount(agentCtx, agentPreset);
+	};
+	if (presets !== void 0 && presetId !== void 0) agentPreset = (await presets.resolve(presetId)).id;
+	const prefix = inheritedSeed(source, plan.boundary);
+	const inherited = SessionLogOffset(prefix.length);
+	const header = {
+		id: childId,
+		version: SESSION_FORMAT_VERSION,
+		createdAt: Date.now(),
+		...source.header.cwd === void 0 ? {} : { cwd: source.header.cwd },
+		parentSession: source.id,
+		isSeeded: true,
+		...agentPreset === void 0 ? {} : { agentPreset }
+	};
+	const events = [...Session.create(childId, prefix, header, inherited).snapshotEvents()];
+	appendVersionRecord(events, plan.version);
+	if (plan.manualTurn !== void 0) appendManualTurn(events, plan.manualTurn, options);
+	const prepared = Session.fromRestore(childId, structuredClone(events), header, inherited, "detached");
 	try {
-		await ctx.sessions.flush(child.agent.session);
+		const stored = await ctx.sessionPersistence.create(header, { inheritedEventCount: inherited });
+		try {
+			await stored.append(prepared.snapshotEvents());
+			await stored.flush();
+		} finally {
+			await stored.close();
+		}
+	} catch (error) {
+		throw new Error(`版本 ${childId} 保存失败，持久化状态需要检查：${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	}
+	try {
+		const child = await ctx.agents.resume({
+			resumeSessionId: childId,
+			agentOptions: options,
+			setup
+		});
+		try {
+			await ctx.sessions.flush(child.agent.session);
+		} catch (error) {
+			await child.dispose();
+			throw error;
+		}
 		return child;
 	} catch (error) {
-		await child.dispose();
-		throw error;
+		throw new Error(`版本 ${childId} 已保存，但启动失败，可从版本树恢复：${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}
 }
 function sourceWorkspace(ctx, sessionId) {
@@ -378,7 +413,7 @@ async function runOperation(ctx, operation) {
 		const childId = sessionIdOf(`session-${crypto.randomUUID()}`);
 		const inverses = [];
 		try {
-			const events = source.session.events;
+			const events = source.session.snapshotEvents();
 			const plan = planOperation(operation, events);
 			const options = agentOptions(events, source.options);
 			const child = await createVersionAgent(ctx, source.session, childId, plan, options);
@@ -404,16 +439,115 @@ async function runOperation(ctx, operation) {
 		}
 	});
 }
-function ownVersionEvent(header, events) {
-	const inherited = header.seedLength ?? 0;
-	const ownEvents = events.filter((event) => event.type === "message-edit/version" && event.seq >= inherited);
+function isRecord(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isVersionOperation(value) {
+	return value === "edit" || value === "reroll" || value === "retry";
+}
+function isCascadePolicy(value) {
+	return value === "truncate" || value === "preserve";
+}
+function isEditableBlockKind(value) {
+	return value === "user" || value === "assistant.reasoning" || value === "assistant.response";
+}
+function isSafeCount(value) {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+/** Validate one stored forward effect. */
+function decodeEffect(effect, sessionId) {
+	const id = effect["id"];
+	const operation = effect["operation"];
+	const cascade = effect["cascade"];
+	const targetTurn = effect["targetTurn"];
+	const targetEventSeq = effect["targetEventSeq"];
+	const targetBlockIndex = effect["targetBlockIndex"];
+	const blockKind = effect["blockKind"];
+	const before = effect["before"];
+	const after = effect["after"];
+	if (typeof id !== "string" || !isVersionOperation(operation) || !isCascadePolicy(cascade) || !isSafeCount(targetTurn) || !isSafeCount(targetEventSeq) || targetBlockIndex !== void 0 && !isSafeCount(targetBlockIndex) || blockKind !== void 0 && !isEditableBlockKind(blockKind) || before !== void 0 && typeof before !== "string" || after !== void 0 && typeof after !== "string") throw new Error(`会话 ${sessionId} 的版本效果字段无效。`);
+	return {
+		id,
+		operation,
+		cascade,
+		targetTurn,
+		targetEventSeq,
+		...targetBlockIndex === void 0 ? {} : { targetBlockIndex },
+		...blockKind === void 0 ? {} : { blockKind },
+		...before === void 0 ? {} : { before },
+		...after === void 0 ? {} : { after }
+	};
+}
+/**
+* Validate one stored version payload. The record boundary is a durable file
+* boundary, so a restored record is untrusted even though this plugin wrote
+* the live one.
+*/
+function decodeStoredVersionEvent(data, sessionId) {
+	if (!isRecord(data)) throw new Error(`会话 ${sessionId} 的版本记录不是对象。`);
+	if (data["schemaVersion"] !== void 0) {
+		const effect = data["effect"];
+		const inverse = data["inverse"];
+		if (data["schemaVersion"] !== 2 || !isRecord(effect) || !isRecord(inverse)) throw new Error(`会话 ${sessionId} 使用不支持的版本效果结构。`);
+		const inverseSessionId = inverse["sessionId"];
+		if (inverse["kind"] !== "restore-version" || typeof inverseSessionId !== "string") throw new Error(`会话 ${sessionId} 的版本逆字段无效。`);
+		return {
+			schemaVersion: 2,
+			effect: decodeEffect(effect, sessionId),
+			inverse: {
+				kind: "restore-version",
+				sessionId: inverseSessionId
+			}
+		};
+	}
+	const sourceSessionId = data["sourceSessionId"];
+	const operation = data["operation"];
+	const cascade = data["cascade"];
+	const targetTurn = data["targetTurn"];
+	const targetEventSeq = data["targetEventSeq"];
+	const targetBlockIndex = data["targetBlockIndex"];
+	const blockKind = data["blockKind"];
+	const before = data["before"];
+	const after = data["after"];
+	if (typeof sourceSessionId !== "string" || !isVersionOperation(operation) || !isCascadePolicy(cascade) || !isSafeCount(targetTurn) || !isSafeCount(targetEventSeq) || targetBlockIndex !== void 0 && !isSafeCount(targetBlockIndex) || blockKind !== void 0 && !isEditableBlockKind(blockKind) || before !== void 0 && typeof before !== "string" || after !== void 0 && typeof after !== "string") throw new Error(`会话 ${sessionId} 的旧版版本记录字段无效。`);
+	return {
+		sourceSessionId,
+		operation,
+		cascade,
+		targetTurn,
+		targetEventSeq,
+		...targetBlockIndex === void 0 ? {} : { targetBlockIndex },
+		...blockKind === void 0 ? {} : { blockKind },
+		...before === void 0 ? {} : { before },
+		...after === void 0 ? {} : { after }
+	};
+}
+/** Read this plugin's ignorable record from one committed event. */
+function messageEditRecordOf(event) {
+	const type = event.type;
+	if (event.ignorable !== true || type !== "plugin:message-edit/version") return void 0;
+	return {
+		data: event.data,
+		seq: event.seq,
+		time: event.time
+	};
+}
+/** Read this Session's own version record from its fork-inherited boundary. */
+function ownVersionEvent(header, events, inherited) {
+	const ownEvents = [];
+	for (const event of events) {
+		if (event.seq < inherited) continue;
+		const record = messageEditRecordOf(event);
+		if (record === void 0) continue;
+		ownEvents.push(record);
+	}
 	if (ownEvents.length === 0) return void 0;
 	if (ownEvents.length > 1) throw new Error(`会话 ${header.id} 包含多个自身版本效果。`);
 	const event = ownEvents[0];
 	if (event === void 0) return void 0;
+	const version = decodeStoredVersionEvent(event.data, header.id);
 	const parent = header.parentSession;
-	if ("schemaVersion" in event.data) {
-		const version = event.data;
+	if ("schemaVersion" in version) {
 		if (version.schemaVersion !== 2) throw new Error(`会话 ${header.id} 使用不支持的版本效果结构。`);
 		if (version.inverse.kind !== "restore-version" || parent === void 0 || version.inverse.sessionId !== parent) throw new Error(`会话 ${header.id} 的版本效果与逆不匹配。`);
 		return {
@@ -422,7 +556,7 @@ function ownVersionEvent(header, events) {
 			time: event.time
 		};
 	}
-	const legacy = event.data;
+	const legacy = version;
 	if (parent === void 0 || legacy.sourceSessionId !== parent) throw new Error(`会话 ${header.id} 的旧版恢复目标与父版本不匹配。`);
 	return {
 		effect: {
@@ -475,23 +609,31 @@ async function mapConcurrent(items, worker) {
 	await Promise.all(Array.from({ length: workers }, () => run()));
 	return results;
 }
-/** Full log for the requested session: live borrow, persisted inspection, query fallback. */
 async function readCurrentLog(ctx, sessionId) {
 	const live = ctx.sessions.get(sessionId);
-	if (live !== void 0) return live.events;
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.inspect(sessionId)).events;
-	return (await ctx.sessionQuery.readSession(sessionId)).events;
+	if (live !== void 0) return {
+		events: live.snapshotEvents(),
+		inheritedEventCount: live.inheritedEventCount
+	};
+	return ctx.sessionQuery.readSession(sessionId);
 }
 /** Own-version scan window for one lineage node: the tail from the durable
 * seed boundary is enough, and root nodes cannot carry a version effect. */
 async function versionLog(ctx, record) {
-	const inherited = record.header.seedLength ?? 0;
 	const live = ctx.sessions.get(record.header.id);
-	if (live !== void 0) return live.events.slice(inherited);
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.readFrom(record.header.id, inherited)).events;
-	return (await ctx.sessionQuery.readSession(record.header.id)).events.slice(inherited);
+	if (live !== void 0) return {
+		events: live.ownEvents(),
+		inheritedEventCount: live.inheritedEventCount
+	};
+	const handle = await ctx.sessionPersistence.open(record.header.id, "read");
+	try {
+		return {
+			events: (await handle.read(handle.inheritedEventCount)).events,
+			inheritedEventCount: handle.inheritedEventCount
+		};
+	} finally {
+		await handle.close();
+	}
 }
 async function timeline(ctx, sessionId) {
 	const targetTrace = await ctx.sessionQuery.traceSession(sessionId);
@@ -500,7 +642,10 @@ async function timeline(ctx, sessionId) {
 	const lineage = flattenLineage(rootTrace.target, rootTrace.descendants);
 	const logs = await mapConcurrent(lineage, async ({ record }) => {
 		if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId);
-		if (record.header.parentSession === void 0) return [];
+		if (record.header.parentSession === void 0) return {
+			events: [],
+			inheritedEventCount: 0
+		};
 		return versionLog(ctx, record);
 	});
 	const recordsById = new Map(lineage.map(({ record }) => [record.header.id, record]));
@@ -511,7 +656,8 @@ async function timeline(ctx, sessionId) {
 		pathId = recordsById.get(pathId)?.header.parentSession;
 	}
 	const versions = lineage.map(({ record, depth }, index) => {
-		const version = ownVersionEvent(record.header, logs[index] ?? []);
+		const log = logs[index];
+		const version = ownVersionEvent(record.header, log?.events ?? [], log?.inheritedEventCount ?? 0);
 		return {
 			sessionId: record.header.id,
 			...record.header.parentSession === void 0 ? {} : { parentSessionId: record.header.parentSession },
@@ -553,7 +699,7 @@ async function timeline(ctx, sessionId) {
 	const currentIndex = versions.findIndex((version) => version.current);
 	const currentLog = logs[currentIndex];
 	if (currentIndex < 0 || currentLog === void 0) throw new Error("当前版本不在版本树中。");
-	const turns = closedTurns(currentLog);
+	const turns = closedTurns(currentLog.events);
 	return {
 		sessionId,
 		messages: editableMessages(turns),
@@ -606,54 +752,29 @@ function decodeOperation(value) {
 		default: throw new TypeError("action 必须是 edit、reroll 或 retry。");
 	}
 }
-function requestJson(request) {
-	return new Promise((resolve, reject) => {
-		const decoder = new TextDecoder();
-		let text = "";
-		request.on("data", (chunk) => {
-			text += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-		});
-		request.on("end", () => {
-			try {
-				text += decoder.decode();
-				resolve(JSON.parse(text));
-			} catch (error) {
-				reject(error);
-			}
-		});
-		request.on("error", reject);
+function jsonResponse(status, value) {
+	return Response.json(value, {
+		status,
+		headers: { "cache-control": "no-store" }
 	});
 }
-function respondJson(response, status, value) {
-	response.writeHead(status, {
-		"content-type": "application/json; charset=utf-8",
-		"cache-control": "no-store"
-	});
-	response.end(JSON.stringify(value));
-}
-async function handleRoute(ctx, request, response) {
+async function handleRoute(ctx, request) {
 	try {
-		if (request.method === "GET") {
-			respondJson(response, 200, await timeline(ctx, sessionIdOf(new URL(request.url ?? "/message-edit", "http://message-edit.local").searchParams.get("sessionId"))));
-			return;
-		}
-		if (request.method === "POST") {
-			respondJson(response, 200, await runOperation(ctx, decodeOperation(await requestJson(request))));
-			return;
-		}
-		response.writeHead(405);
-		response.end();
+		if (request.method === "GET") return jsonResponse(200, await timeline(ctx, sessionIdOf(new URL(request.url).searchParams.get("sessionId"))));
+		if (request.method === "POST") return jsonResponse(200, await runOperation(ctx, decodeOperation(await request.json())));
+		return new Response(null, { status: 405 });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		respondJson(response, error instanceof TypeError ? 400 : 409, { error: message });
+		return jsonResponse(error instanceof TypeError || error instanceof SyntaxError ? 400 : 409, { error: message });
 	}
 }
-/** Register the reversible route contribution. */
+/** Register through DSH's authenticated, bounded HTTP transport. */
 function apply(ctx) {
-	ctx.effect(() => ctx.webServer.register({
-		kind: "exact",
+	ctx.effect(() => ctx.connection.fetch.register({
 		path: MESSAGE_EDIT_PATH,
-		handler: (request, response) => handleRoute(ctx, request, response)
+		methods: ["GET", "POST"],
+		requestBody: "buffered",
+		fetch: (request) => handleRoute(ctx, request)
 	}), "message-edit: HTTP route");
 }
 //#endregion

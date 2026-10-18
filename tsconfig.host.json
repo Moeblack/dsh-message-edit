@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "tsBuildInfoFile": "node_modules/.cache/host.tsbuildinfo" },
+  "include": ["src/index.ts", "src/shared.ts"]
+}
