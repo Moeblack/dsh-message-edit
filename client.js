@@ -4,9 +4,46 @@ window.__ModuleLoader__.load({
 		var module = { exports: {} };
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
-		let _deepseek_ai_dsh_client_runtime_client = require("@deepseek-ai/dsh-client-runtime/client");
+		let _deepseek_ai_dsh_client_runtime_client = { createSnapshotStore };
 		let react = require("react");
 		let react_jsx_runtime = require("react/jsx-runtime");
+		/**
+		 * Local snapshot store (rc.5 has no `@deepseek-ai/dsh-client-runtime`).
+		 * Surface: getSnapshot / subscribe / set / update(mutator).
+		 */
+		function createSnapshotStore(initial) {
+			let state = initial;
+			const listeners = new Set();
+			const store = {
+				getSnapshot: () => state,
+				subscribe(listener) {
+					listeners.add(listener);
+					return () => { listeners.delete(listener); };
+				},
+				set(next) {
+					state = next;
+					for (const listener of [...listeners]) listener();
+				},
+				update(mutator) {
+					const draft = { ...state };
+					mutator(draft);
+					store.set(draft);
+				},
+			};
+			return store;
+		}
+		/**
+		 * rc.5 session navigation: the current Session is whichever one holds a
+		 * `mainView` retention, and `sessions` no longer exposes `open(id)`.
+		 * Holding one reference here and releasing the previous one is the
+		 * same policy `@deepseek-ai/dsh-client-ui-workspace` applies.
+		 */
+		let mainViewReference;
+		function releaseMainView() {
+			const reference = mainViewReference;
+			mainViewReference = void 0;
+			reference?.release();
+		}
 		//#region src/shared.ts
 		/** Same-origin endpoint owned by the Message Edit host plugin. */
 		const MESSAGE_EDIT_PATH = "/message-edit";
@@ -383,10 +420,32 @@ window.__ModuleLoader__.load({
 					return false;
 				}
 			}
+			/** rc.5 navigation: hand the switch to the Workspace controller when it is mounted. */
+			openMain(sessionId) {
+				if (this.disposed) return;
+				const workspace = this.ctx.get?.("uiWorkspace");
+				if (typeof workspace?.openSession === "function") {
+					releaseMainView();
+					workspace.openSession(sessionId);
+					return;
+				}
+				if (mainViewReference?.sessionId === sessionId) return;
+				if (this.sessions.list.getSnapshot().byId[sessionId] === void 0) return;
+				let reference;
+				try {
+					reference = this.sessions.retain(sessionId, { source: "mainView" });
+				} catch (error) {
+					return;
+				}
+				const previous = mainViewReference;
+				mainViewReference = reference;
+				previous?.release();
+				this.ctx.layout?.selectPanel(null);
+			}
 			/** Session-list publication is the reactive dependency for navigation. */
 			openWhenListed(sessionId) {
 				if (this.sessions.list.getSnapshot().byId[sessionId] !== void 0) {
-					this.sessions.open(sessionId);
+					this.openMain(sessionId);
 					return Promise.resolve();
 				}
 				return new Promise((resolve) => {
@@ -397,7 +456,7 @@ window.__ModuleLoader__.load({
 						settled = true;
 						dispose();
 						this.navigationWaits.delete(cancel);
-						if (open) this.sessions.open(sessionId);
+						if (open) this.openMain(sessionId);
 						resolve();
 					};
 					const cancel = () => {
@@ -1213,8 +1272,6 @@ window.__ModuleLoader__.load({
 		/** Explicit value sources and slot declaration-order edges. */
 		const inject = [
 			"slots",
-			"conversation",
-			"connection",
 			"sessions"
 		];
 		/** Register both UI contributions over one per-session controller identity. */
@@ -1231,19 +1288,24 @@ window.__ModuleLoader__.load({
 			ctx.on("connection/reset", () => {
 				for (const controller of controllers.values()) controller.refreshIfLoaded();
 			});
-			ctx.slots.register({
+			/** rc.5 registers a list entry through `slots.inject(name, register)`. */
+			const intoSlot = (name, register) => {
+				if (typeof ctx.slots.inject === "function") return ctx.slots.inject(name, register);
+				return register();
+			};
+			intoSlot("conversation.view", () => ctx.slots.register({
 				name: "conversation.view",
 				id: "message-edit-timeline",
 				order: 15,
-				label: "Timeline",
+				label: () => "Timeline",
 				inject: (sessionId) => controllerFor(sessionId).face
-			}, MessageEditTimelineView);
-			ctx.slots.register({
+			}, MessageEditTimelineView));
+			intoSlot("conversation.session.header.actions", () => ctx.slots.register({
 				name: "conversation.session.header.actions",
 				id: "message-edit-controls",
 				order: 15,
 				inject: (sessionId) => controllerFor(sessionId).face
-			}, MessageEditHeader);
+			}, MessageEditHeader));
 		}
 		//#endregion
 		exports.apply = apply;

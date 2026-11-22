@@ -5,6 +5,11 @@ const MESSAGE_EDIT_PATH = "/message-edit";
 const MESSAGE_EDIT_VIEW_ORDER = 15;
 /** Current durable event schema for structurally paired version effects. */
 const MESSAGE_EDIT_VERSION_SCHEMA = 2;
+/**
+ * 分支版本默认「归档」，从而不出现在会话列表里——用户想要的是「一份对话 + 可切换的版本」，
+ * 而不是每编辑一次就在侧边栏多出一个同名会话。设为 false 可恢复成「每个分支都是一个独立会话」。
+ */
+const PARK_VERSION_BRANCHES = true;
 //#endregion
 //#region src/index.ts
 /** Stable Cordis plugin name. */
@@ -126,6 +131,26 @@ function retryableTurns(turns) {
 function downstreamUsers(turns, start) {
 	return turns.slice(start).flatMap((turn) => turn.user === void 0 ? [] : [cloneUser(turn.user.data)]);
 }
+/**
+ * Locate the inbox splice that queued the turn's own user input.
+ *
+ * A turn's prompt is staged in the inbox before `turn/start` and drained into a
+ * `user/message` surface event when the turn begins. Keeping that splice in the
+ * inherited prefix makes the new version replay the original prompt instead of
+ * the replacement, so the cut has to land before the splice.
+ */
+function queuedInputBoundary(events, turn) {
+	const userId = turn.user?.data?.id;
+	for (let index = turn.startSeq - 1; index >= 0; index -= 1) {
+		const event = events[index];
+		if (event?.type !== "agent/inbox/spliced") continue;
+		if (event.data["target"] !== "next-turn") continue;
+		const inserted = Array.isArray(event.data["inserted"]) ? event.data["inserted"] : [];
+		if (inserted.length === 0) continue;
+		if (userId === void 0 || inserted.some((message) => message?.id === userId)) return event.seq - 1;
+	}
+	return turn.startSeq - 1;
+}
 function assistantReplacement(event, blockIndex, text) {
 	const replaced = replaceTextBlock(event.data.message.content, blockIndex, text).filter((block) => block.type === "text" || block.type === "reasoning");
 	return Object.freeze({
@@ -139,7 +164,7 @@ function assistantReplacement(event, blockIndex, text) {
 		})
 	});
 }
-function editPlan(operation, turns) {
+function editPlan(operation, turns, events) {
 	const turnIndex = turns.findIndex((turn) => operation.eventSeq > turn.startSeq && operation.eventSeq < turn.endSeq);
 	const turn = turns[turnIndex];
 	if (turn === void 0) throw new Error("所选消息不属于已落定回合。");
@@ -151,7 +176,7 @@ function editPlan(operation, turns) {
 		const edited = cloneUser(event.data, replaceTextBlock(event.data.content, operation.blockIndex, operation.text));
 		const later = operation.cascade === "preserve" ? downstreamUsers(turns, turnIndex + 1) : [];
 		return {
-			boundary: turn.startSeq - 1,
+			boundary: queuedInputBoundary(events, turn),
 			version: pairVersionEffect(operation.sessionId, {
 				operation: "edit",
 				cascade: operation.cascade,
@@ -170,7 +195,7 @@ function editPlan(operation, turns) {
 	const blockKind = before.type === "reasoning" ? "assistant.reasoning" : "assistant.response";
 	if (turn.user === void 0) throw new Error("所选助手消息没有可重建的用户输入。");
 	return {
-		boundary: turn.startSeq - 1,
+		boundary: queuedInputBoundary(events, turn),
 		version: pairVersionEffect(operation.sessionId, {
 			operation: "edit",
 			cascade: operation.cascade,
@@ -189,12 +214,12 @@ function editPlan(operation, turns) {
 		queuedUsers: operation.cascade === "preserve" ? downstreamUsers(turns, turnIndex + 1) : []
 	};
 }
-function retryPlan(sessionId, turnNumber, cascade, turns) {
+function retryPlan(sessionId, turnNumber, cascade, turns, events) {
 	const turnIndex = turns.findIndex((turn) => turn.turn === turnNumber);
 	const turn = turns[turnIndex];
 	if (turn?.user === void 0) throw new Error("所选回合没有可重放的用户输入。");
 	return {
-		boundary: turn.startSeq - 1,
+		boundary: queuedInputBoundary(events, turn),
 		version: pairVersionEffect(sessionId, {
 			operation: "retry",
 			cascade,
@@ -204,14 +229,14 @@ function retryPlan(sessionId, turnNumber, cascade, turns) {
 		queuedUsers: cascade === "preserve" ? downstreamUsers(turns, turnIndex) : [cloneUser(turn.user.data)]
 	};
 }
-function rerollPlan(sessionId, turns) {
+function rerollPlan(sessionId, turns, events) {
 	for (let index = turns.length - 1; index >= 0; index -= 1) {
 		const turn = turns[index];
 		if (turn?.user === void 0) continue;
 		const target = turn.assistants.findLast((event) => event.data.message.content.some(isTextualBlock));
 		if (target === void 0) continue;
 		return {
-			boundary: turn.startSeq - 1,
+			boundary: queuedInputBoundary(events, turn),
 			version: pairVersionEffect(sessionId, {
 				operation: "reroll",
 				cascade: "truncate",
@@ -226,9 +251,9 @@ function rerollPlan(sessionId, turns) {
 function planOperation(operation, events) {
 	const turns = closedTurns(events);
 	switch (operation.action) {
-		case "edit": return editPlan(operation, turns);
-		case "reroll": return rerollPlan(operation.sessionId, turns);
-		case "retry": return retryPlan(operation.sessionId, operation.turn, operation.cascade, turns);
+		case "edit": return editPlan(operation, turns, events);
+		case "reroll": return rerollPlan(operation.sessionId, turns, events);
+		case "retry": return retryPlan(operation.sessionId, operation.turn, operation.cascade, turns, events);
 	}
 }
 function agentOptions(events, fallback) {
@@ -243,36 +268,43 @@ function agentOptions(events, fallback) {
 		...maxTokens === void 0 ? {} : { maxTokens }
 	};
 }
-async function withSourceAgent(ctx, sessionId, operation) {
-	let handle;
-	let agent = ctx.agents.get(sessionId);
-	if (agent === void 0) {
-		const snapshot = await ctx.sessionQuery.readSession(sessionId);
-		handle = await ctx.agents.resume({
-			resumeSessionId: sessionId,
-			agentOptions: agentOptions(snapshot.events)
-		});
-		agent = handle.agent;
-	}
-	try {
-		return await agent.runMaintenance(async () => operation(agent));
-	} finally {
-		await handle?.dispose();
-	}
+/**
+ * rc.5 reads history through the detached session query snapshot: `Session` no
+ * longer exposes `events` and the persistence service no longer offers
+ * `inspect`/`readFrom`, so every reader goes through `sessionQuery.readSession`.
+ */
+async function readSnapshot(ctx, sessionId) {
+	const snapshot = await ctx.sessionQuery.readSession(sessionId);
+	return {
+		events: snapshot.events,
+		inherited: snapshot.inheritedEventCount
+	};
 }
-function inheritedSeed(source, boundary) {
-	if (boundary === -1) return [];
-	const boundaryEvent = source.events[boundary];
-	if (boundary < 0 || boundaryEvent === void 0 || boundaryEvent.seq !== boundary) throw new Error("分支边界不是连续会话事件。");
-	return source.events.slice(0, boundary + 1);
+/** Copy an inclusive prefix and mark its inherited cut with the durable `session/end-seed` marker. */
+function inheritedSeed(sourceEvents, boundary) {
+	const prefix = boundary === -1 ? [] : sourceEvents.slice(0, boundary + 1);
+	let cutTime = Date.now();
+	if (boundary !== -1) {
+		const boundaryEvent = sourceEvents[boundary];
+		if (boundaryEvent === void 0 || boundaryEvent.seq !== boundary) throw new Error("分支边界不是连续会话事件。");
+		cutTime = boundaryEvent.time;
+	}
+	prefix.push({
+		type: "session/end-seed",
+		seq: prefix.length,
+		time: cutTime,
+		data: { inherited: true }
+	});
+	return prefix;
 }
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
-function appendLogSeedEvent(events, type, data) {
+function appendLogSeedEvent(events, type, data, ignorable) {
 	events.push({
 		type,
 		seq: events.length,
 		time: Date.now(),
-		data
+		data,
+		...ignorable === true ? { ignorable: true } : {}
 	});
 }
 function appendSurfaceSeedEvent(events, type, data, intent) {
@@ -296,11 +328,9 @@ function appendManualTurn(events, manual) {
 	appendSurfaceSeedEvent(events, "assistant/message", {
 		turn,
 		step: 1,
-		message: assistant
-	}, {
-		surfaceOp: "append",
-		sourceEventSeqs: []
-	});
+		message: assistant,
+		stream: []
+	}, { surfaceOp: "append" });
 	appendLogSeedEvent(events, "step/end", {
 		turn,
 		step: 1
@@ -310,27 +340,27 @@ function appendManualTurn(events, manual) {
 		reason: { kind: "completed" }
 	});
 }
-function versionSeed(source, plan) {
-	const events = inheritedSeed(source, plan.boundary);
-	const inheritedLength = events.length;
-	appendLogSeedEvent(events, "message-edit/version", plan.version);
+function versionSeed(sourceEvents, plan) {
+	const events = inheritedSeed(sourceEvents, plan.boundary);
+	const inheritedLength = plan.boundary + 1;
+	appendLogSeedEvent(events, "message-edit/version", plan.version, true);
 	if (plan.manualTurn !== void 0) appendManualTurn(events, plan.manualTurn);
 	return {
 		events,
 		inheritedLength
 	};
 }
-function sessionPreset(session) {
-	for (let index = session.events.length - 1; index >= 0; index -= 1) {
-		const event = session.events[index];
+function sessionPreset(header, events) {
+	for (let index = events.length - 1; index >= 0; index -= 1) {
+		const event = events[index];
 		if (event?.type === "agent-preset/selected") return event.data.agentPreset;
 	}
-	return session.header.agentPreset;
+	return header.agentPreset;
 }
-async function createVersionAgent(ctx, source, childId, plan, options) {
-	const seed = versionSeed(source, plan);
+async function createVersionAgent(ctx, source, events, childId, plan, options) {
+	const seed = versionSeed(events, plan);
 	const presets = ctx.get("agentPresets");
-	const presetId = sessionPreset(source);
+	const presetId = sessionPreset(source.header, events);
 	let agentPreset;
 	let setup;
 	if (presets !== void 0 && presetId !== void 0) {
@@ -343,10 +373,11 @@ async function createVersionAgent(ctx, source, childId, plan, options) {
 	const child = await ctx.agents.create({
 		sessionId: childId,
 		seed: seed.events,
+		inheritedEventCount: seed.inheritedLength,
 		meta: {
 			...source.header.cwd === void 0 ? {} : { cwd: source.header.cwd },
 			parentSession: source.id,
-			seedLength: seed.inheritedLength,
+			isSeeded: true,
 			...agentPreset === void 0 ? {} : { agentPreset }
 		},
 		agentOptions: options,
@@ -363,6 +394,47 @@ async function createVersionAgent(ctx, source, childId, plan, options) {
 function sourceWorkspace(ctx, sessionId) {
 	return ctx.workspaceRegistry.list().find((workspace) => workspace.sessionIds.includes(sessionId));
 }
+
+/**
+ * 版本分支不应当出现在会话列表里（用户看到的是「一份对话」而不是「一堆被切开的对话」）。
+ * DSH 侧边栏按 workspace 成员列会话，`archiveSession` 是唯一既能隐去行、又不改会话身份的手段；
+ * 归档的会话仍可被 ←/→ 打开（`uiWorkspace.openSession` 不校验归档状态）。
+ * 归档可能因为会话正在跑回合而被拒绝（WorkspaceSessionActivityError），这里一律尽力而为。
+ * 只处理「由本插件 fork 出来的版本」（自身事件里有 `message-edit/version`），
+ * 不动 DSH 原生 fork 出来的会话。
+ */
+async function parkVersion(ctx, sessionId) {
+	try {
+		await ctx.workspaceRegistry.archiveSession(sessionId);
+	} catch {}
+}
+async function isVersionBranch(ctx, sessionId) {
+	try {
+		const snapshot = await ctx.sessionQuery.readSession(sessionId);
+		return snapshot.events.some((event) => event.type === "message-edit/version" && event.seq >= snapshot.inheritedEventCount);
+	} catch {
+		return false;
+	}
+}
+
+/** 把该谱系里由本插件产生的分支都归档；根版本（原始对话）保持可见。 */
+async function parkLineage(ctx, sessionId) {
+	if (PARK_VERSION_BRANCHES !== true) return;
+	let entries;
+	try {
+		const trace = await ctx.sessionQuery.traceSession(sessionId);
+		const rootId = trace.complete ? trace.root.header.id : trace.ancestors.at(-1)?.header.id ?? sessionId;
+		const rootTrace = rootId === sessionId ? trace : await ctx.sessionQuery.traceSession(rootId);
+		entries = flattenLineage(rootTrace.target, rootTrace.descendants);
+	} catch {
+		return;
+	}
+	const rootId = entries[0]?.record.header.id;
+	for (const entry of entries) {
+		const id = entry.record.header.id;
+		if (id !== rootId && await isVersionBranch(ctx, id)) await parkVersion(ctx, id);
+	}
+}
 async function recoverOperation(inverses) {
 	const failures = [];
 	for (const inverse of inverses.reverse()) try {
@@ -374,14 +446,19 @@ async function recoverOperation(inverses) {
 }
 async function runOperation(ctx, operation) {
 	const sourceId = sessionIdOf(operation.sessionId);
-	return withSourceAgent(ctx, sourceId, async (source) => {
+	const snapshot = await ctx.sessionQuery.readSession(sourceId);
+	const source = {
+		id: sourceId,
+		header: snapshot.session
+	};
+	const events = snapshot.events;
+	{
 		const childId = sessionIdOf(`session-${crypto.randomUUID()}`);
 		const inverses = [];
 		try {
-			const events = source.session.events;
 			const plan = planOperation(operation, events);
-			const options = agentOptions(events, source.options);
-			const child = await createVersionAgent(ctx, source.session, childId, plan, options);
+			const options = agentOptions(events, undefined);
+			const child = await createVersionAgent(ctx, source, events, childId, plan, options);
 			inverses.push(() => child.dispose());
 			const workspace = sourceWorkspace(ctx, sourceId);
 			if (workspace !== void 0) {
@@ -390,6 +467,7 @@ async function runOperation(ctx, operation) {
 			}
 			for (const message of plan.queuedUsers) child.agent.followup(message);
 			inverses.length = 0;
+			await parkLineage(ctx, childId);
 			return {
 				sessionId: childId,
 				queuedTurns: plan.queuedUsers.length
@@ -402,10 +480,9 @@ async function runOperation(ctx, operation) {
 			}
 			throw error;
 		}
-	});
 }
-function ownVersionEvent(header, events) {
-	const inherited = header.seedLength ?? 0;
+}
+function ownVersionEvent(header, events, inherited) {
 	const ownEvents = events.filter((event) => event.type === "message-edit/version" && event.seq >= inherited);
 	if (ownEvents.length === 0) return void 0;
 	if (ownEvents.length > 1) throw new Error(`会话 ${header.id} 包含多个自身版本效果。`);
@@ -475,34 +552,26 @@ async function mapConcurrent(items, worker) {
 	await Promise.all(Array.from({ length: workers }, () => run()));
 	return results;
 }
-/** Full log for the requested session: live borrow, persisted inspection, query fallback. */
-async function readCurrentLog(ctx, sessionId) {
-	const live = ctx.sessions.get(sessionId);
-	if (live !== void 0) return live.events;
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.inspect(sessionId)).events;
-	return (await ctx.sessionQuery.readSession(sessionId)).events;
-}
-/** Own-version scan window for one lineage node: the tail from the durable
-* seed boundary is enough, and root nodes cannot carry a version effect. */
-async function versionLog(ctx, record) {
-	const inherited = record.header.seedLength ?? 0;
-	const live = ctx.sessions.get(record.header.id);
-	if (live !== void 0) return live.events.slice(inherited);
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.readFrom(record.header.id, inherited)).events;
-	return (await ctx.sessionQuery.readSession(record.header.id)).events.slice(inherited);
-}
 async function timeline(ctx, sessionId) {
 	const targetTrace = await ctx.sessionQuery.traceSession(sessionId);
 	const rootId = targetTrace.complete ? targetTrace.root.header.id : targetTrace.ancestors.at(-1)?.header.id ?? sessionId;
 	const rootTrace = rootId === sessionId ? targetTrace : await ctx.sessionQuery.traceSession(rootId);
 	const lineage = flattenLineage(rootTrace.target, rootTrace.descendants);
-	const logs = await mapConcurrent(lineage, async ({ record }) => {
-		if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId);
-		if (record.header.parentSession === void 0) return [];
-		return versionLog(ctx, record);
+	const snapshots = await mapConcurrent(lineage, async ({ record }) => {
+		if (record.header.id === sessionId || record.header.parentSession !== void 0) return readSnapshot(ctx, record.header.id);
+		return {
+			events: [],
+			inherited: 0
+		};
 	});
+	if (PARK_VERSION_BRANCHES === true) {
+		for (const [index, entry] of lineage.entries()) {
+			if (index === 0) continue;
+			const snapshot = snapshots[index];
+			const isVersion = snapshot.events.some((event) => event.type === "message-edit/version" && event.seq >= snapshot.inherited);
+			if (isVersion) await parkVersion(ctx, entry.record.header.id);
+		}
+	}
 	const recordsById = new Map(lineage.map(({ record }) => [record.header.id, record]));
 	const currentPath = /* @__PURE__ */ new Set();
 	let pathId = sessionId;
@@ -511,7 +580,8 @@ async function timeline(ctx, sessionId) {
 		pathId = recordsById.get(pathId)?.header.parentSession;
 	}
 	const versions = lineage.map(({ record, depth }, index) => {
-		const version = ownVersionEvent(record.header, logs[index] ?? []);
+		const snapshot = snapshots[index];
+		const version = ownVersionEvent(record.header, snapshot.events.slice(snapshot.inherited), snapshot.inherited);
 		return {
 			sessionId: record.header.id,
 			...record.header.parentSession === void 0 ? {} : { parentSessionId: record.header.parentSession },
@@ -551,7 +621,7 @@ async function timeline(ctx, sessionId) {
 	}
 	const redoSessionIds = versions.filter((version) => version.inverseSessionId === sessionId).map((version) => version.sessionId);
 	const currentIndex = versions.findIndex((version) => version.current);
-	const currentLog = logs[currentIndex];
+	const currentLog = snapshots[currentIndex]?.events;
 	if (currentIndex < 0 || currentLog === void 0) throw new Error("当前版本不在版本树中。");
 	const turns = closedTurns(currentLog);
 	return {
